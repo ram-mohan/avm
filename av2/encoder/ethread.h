@@ -71,6 +71,9 @@ int av2_compute_num_enc_workers(AV2_COMP *cpi, int max_workers);
 
 void av2_create_workers(AV2_COMP *cpi, int num_workers);
 
+void av2_ccso_search_mt(AV2_COMP *cpi, int ccso_stride, int ccso_height,
+                        int sb_count);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

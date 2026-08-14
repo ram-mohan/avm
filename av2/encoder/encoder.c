@@ -1825,6 +1825,8 @@ static AVM_INLINE void free_thread_data(AV2_COMP *cpi) {
     av2_free_pc_tree_recursive(thread_data->td->pc_root, av2_num_planes(cm), 0,
                                0);
     thread_data->td->pc_root = NULL;
+    av2_free_ccso_search_buffers(thread_data->td->ccso_ctx);
+    avm_free(thread_data->td->ccso_ctx);
 #if CONFIG_ML_PART_SPLIT
     av2_part_prune_tflite_close(&(thread_data->td->partition_model));
 #endif  // CONFIG_ML_PART_SPLIT
@@ -1981,6 +1983,8 @@ void av2_remove_compressor(AV2_COMP *cpi) {
 #if CONFIG_MULTITHREAD
   pthread_mutex_t *const enc_row_mt_mutex_ = mt_info->enc_row_mt.mutex_;
   pthread_mutex_t *const gm_mt_mutex_ = mt_info->gm_sync.mutex_;
+  pthread_mutex_t *const ccso_search_mt_mutex_ =
+      mt_info->ccso_search_sync.mutex_;
   if (enc_row_mt_mutex_ != NULL) {
     pthread_mutex_destroy(enc_row_mt_mutex_);
     avm_free(enc_row_mt_mutex_);
@@ -1988,6 +1992,10 @@ void av2_remove_compressor(AV2_COMP *cpi) {
   if (gm_mt_mutex_ != NULL) {
     pthread_mutex_destroy(gm_mt_mutex_);
     avm_free(gm_mt_mutex_);
+  }
+  if (ccso_search_mt_mutex_ != NULL) {
+    pthread_mutex_destroy(ccso_search_mt_mutex_);
+    avm_free(ccso_search_mt_mutex_);
   }
 #endif
   av2_row_mt_mem_dealloc(cpi);

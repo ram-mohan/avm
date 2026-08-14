@@ -20,6 +20,7 @@
 #include "av2/encoder/firstpass.h"
 #include "av2/encoder/global_motion.h"
 #include "av2/encoder/global_motion_facade.h"
+#include "av2/encoder/pickccso.h"
 #include "av2/encoder/rdopt.h"
 #include "avm_dsp/avm_dsp_common.h"
 #include "av2/encoder/tpl_model.h"
@@ -581,6 +582,13 @@ static AVM_INLINE void create_enc_workers(AV2_COMP *cpi, int num_workers) {
                     avm_malloc(sizeof(*(gm_sync->mutex_))));
     if (gm_sync->mutex_) pthread_mutex_init(gm_sync->mutex_, NULL);
   }
+  AV2CcsoSearchSync *ccso_search_sync = &mt_info->ccso_search_sync;
+  if (ccso_search_sync->mutex_ == NULL) {
+    CHECK_MEM_ERROR(cm, ccso_search_sync->mutex_,
+                    avm_malloc(sizeof(*(ccso_search_sync->mutex_))));
+    if (ccso_search_sync->mutex_)
+      pthread_mutex_init(ccso_search_sync->mutex_, NULL);
+  }
 #endif
 
   for (int i = num_workers - 1; i >= 0; i--) {
@@ -655,6 +663,9 @@ static AVM_INLINE void create_enc_workers(AV2_COMP *cpi, int num_workers) {
       CHECK_MEM_ERROR(
           cm, thread_data->td->mbmi_ext,
           avm_calloc(sb_mi_size, sizeof(*thread_data->td->mbmi_ext)));
+
+      CHECK_MEM_ERROR(cm, thread_data->td->ccso_ctx,
+                      avm_calloc(1, sizeof(*thread_data->td->ccso_ctx)));
 
       // Create threads
       if (!winterface->reset(worker))
@@ -1620,4 +1631,104 @@ void av2_global_motion_estimation_mt(AV2_COMP *cpi) {
   prepare_gm_workers(cpi, gm_mt_worker_hook, num_workers);
   launch_enc_workers(&cpi->mt_info, num_workers);
   sync_enc_workers(&cpi->mt_info, &cpi->common, num_workers);
+}
+
+// Hook function of each thread in ccso search multi-threading.
+static int ccso_search_mt_worker_hook(void *arg1, void *unused) {
+  (void)unused;
+  EncWorkerData *thread_data = (EncWorkerData *)arg1;
+  AV2_COMP *cpi = thread_data->cpi;
+  AV2_COMMON *cm = &cpi->common;
+  ThreadData *td = thread_data->td;
+  AV2CcsoSearchSync *ccso_search_sync = &cpi->mt_info.ccso_search_sync;
+  CcsoCtx *ctx = td->ccso_ctx;
+#if CONFIG_MULTITHREAD
+  pthread_mutex_t *mutex_ = ccso_search_sync->mutex_;
+#endif
+
+  while (1) {
+    CcsoSearchJobInfo job;
+    int has_job = 0;
+
+#if CONFIG_MULTITHREAD
+    pthread_mutex_lock(mutex_);
+#endif
+    if (ccso_search_sync->next_job < ccso_search_sync->total_jobs) {
+      job = ccso_search_sync->job_list[ccso_search_sync->next_job++];
+      has_job = 1;
+    }
+#if CONFIG_MULTITHREAD
+    pthread_mutex_unlock(mutex_);
+#endif
+    if (!has_job) break;
+
+    av2_ccso_ctx_load_job(ctx, &job);
+    av2_ccso_param_search(cm, ctx, &td->mb.e_mbd);
+  }
+  return 1;
+}
+
+// Assigns the ccso search hook function and thread data to each worker.
+static void prepare_ccso_search_workers(AV2_COMP *cpi, AVxWorkerHook hook,
+                                        int num_workers) {
+  MultiThreadInfo *mt_info = &cpi->mt_info;
+  for (int i = num_workers - 1; i >= 0; --i) {
+    AVxWorker *worker = &mt_info->workers[i];
+    EncWorkerData *thread_data = &mt_info->tile_thr_data[i];
+
+    worker->hook = hook;
+    worker->data1 = thread_data;
+    worker->data2 = NULL;
+
+    thread_data->cpi = cpi;
+  }
+}
+
+// Dispatches the ccso parameter search for the plane described by `ctx`. After
+// all workers finish, reduce their per-thread best results into `ctx`.
+void av2_ccso_search_mt(AV2_COMP *cpi, int ccso_stride, int ccso_height,
+                        int sb_count) {
+  AV2_COMMON *cm = &cpi->common;
+  CcsoCtx *ctx = &cpi->ccso_ctx;
+  AV2CcsoSearchSync *ccso_search_sync = &cpi->mt_info.ccso_search_sync;
+  const int num_workers = cpi->mt_info.num_workers;
+
+  ccso_search_sync->total_jobs = av2_ccso_build_search_job_list(
+      ccso_search_sync->job_list, ctx->ccso_cm.early_terminate_ccso_search);
+  ccso_search_sync->next_job = 0;
+
+  const int num_planes = av2_num_planes(cm);
+  for (int i = 1; i < num_workers; ++i) {
+    CcsoCtx *worker_ctx = cpi->mt_info.tile_thr_data[i].td->ccso_ctx;
+    av2_ccso_ctx_reset(worker_ctx);
+    av2_ccso_alloc_search_buffers(cm, worker_ctx, ccso_stride, ccso_height,
+                                  sb_count);
+    worker_ctx->ccso_cm = ctx->ccso_cm;
+    worker_ctx->final.filtered_cost = UINT64_MAX;
+    worker_ctx->final.ref_idx = -1;
+    worker_ctx->final.job_idx = INT32_MAX;
+    worker_ctx->ccso_stride = ctx->ccso_stride;
+    worker_ctx->ccso_stride_ext = ctx->ccso_stride_ext;
+
+    MACROBLOCKD *const worker_xd = &cpi->mt_info.tile_thr_data[i].td->mb.e_mbd;
+    av2_setup_dst_planes(worker_xd->plane, &cm->cur_frame->buf, 0 /* mi_row */,
+                         0 /* mi_col */, AVM_PLANE_Y, num_planes, NULL);
+  }
+
+  prepare_ccso_search_workers(cpi, ccso_search_mt_worker_hook, num_workers);
+  launch_enc_workers(&cpi->mt_info, num_workers);
+  sync_enc_workers(&cpi->mt_info, cm, num_workers);
+
+  // pick the best candidate from all workers
+  for (int i = 1; i < num_workers; ++i) {
+    CcsoCtx *worker_ctx = cpi->mt_info.tile_thr_data[i].td->ccso_ctx;
+    if (worker_ctx->final.filtered_cost > ctx->final.filtered_cost) continue;
+    if (worker_ctx->final.filtered_cost == ctx->final.filtered_cost &&
+        worker_ctx->final.job_idx > ctx->final.job_idx)
+      continue;
+
+    ctx->final = worker_ctx->final;
+    memcpy(ctx->final_filter_control, worker_ctx->final_filter_control,
+           sizeof(*ctx->final_filter_control) * sb_count);
+  }
 }
