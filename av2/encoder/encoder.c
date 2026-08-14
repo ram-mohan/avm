@@ -1821,6 +1821,8 @@ static AVM_INLINE void free_thread_data(AV2_COMP *cpi) {
     av2_free_pc_tree_recursive(thread_data->td->pc_root, av2_num_planes(cm), 0,
                                0);
     thread_data->td->pc_root = NULL;
+    av2_free_ccso_search_buffers(thread_data->td->ccso_ctx);
+    avm_free(thread_data->td->ccso_ctx);
 #if CONFIG_ML_PART_SPLIT
     av2_part_prune_tflite_close(&(thread_data->td->partition_model));
 #endif  // CONFIG_ML_PART_SPLIT
@@ -1977,6 +1979,8 @@ void av2_remove_compressor(AV2_COMP *cpi) {
 #if CONFIG_MULTITHREAD
   pthread_mutex_t *const enc_row_mt_mutex_ = mt_info->enc_row_mt.mutex_;
   pthread_mutex_t *const gm_mt_mutex_ = mt_info->gm_sync.mutex_;
+  pthread_mutex_t *const ccso_search_mt_mutex_ =
+      mt_info->ccso_search_sync.mutex_;
   if (enc_row_mt_mutex_ != NULL) {
     pthread_mutex_destroy(enc_row_mt_mutex_);
     avm_free(enc_row_mt_mutex_);
@@ -1984,6 +1988,10 @@ void av2_remove_compressor(AV2_COMP *cpi) {
   if (gm_mt_mutex_ != NULL) {
     pthread_mutex_destroy(gm_mt_mutex_);
     avm_free(gm_mt_mutex_);
+  }
+  if (ccso_search_mt_mutex_ != NULL) {
+    pthread_mutex_destroy(ccso_search_mt_mutex_);
+    avm_free(ccso_search_mt_mutex_);
   }
 #endif
   av2_row_mt_mem_dealloc(cpi);
@@ -1996,6 +2004,7 @@ void av2_remove_compressor(AV2_COMP *cpi) {
   if (mt_info->num_workers > 1) {
     av2_loop_filter_dealloc(&mt_info->lf_row_sync);
     av2_loop_restoration_dealloc(&mt_info->lr_row_sync, mt_info->num_workers);
+    av2_ccso_filter_dealloc(&mt_info->ccso_sync);
     av2_gm_dealloc(&mt_info->gm_sync);
   }
 
@@ -3206,7 +3215,12 @@ static void cdef_restoration_frame(AV2_COMP *cpi, AV2_COMMON *cm,
                     cpi->error_resilient_frame_seen,
                     cpi->sf.lpf_sf.early_terminate_ccso_search_by_cost,
                     cpi->sf.lpf_sf.ccso_chroma_dep);
-    ccso_frame(&cm->cur_frame->buf, cm, xd, ext_rec_y);
+    if (num_workers > 1 && !cm->seq_params.disable_loopfilters_across_tiles) {
+      av2_ccso_frame_mt(&cm->cur_frame->buf, cm, xd, mt_info->workers,
+                        num_workers, ext_rec_y, &mt_info->ccso_sync);
+    } else {
+      ccso_frame(&cm->cur_frame->buf, cm, xd, ext_rec_y);
+    }
 #if CONFIG_MISMATCH_DEBUG
     mismatch_record_frame(&cm->cur_frame->buf, num_planes, 2);
 #endif

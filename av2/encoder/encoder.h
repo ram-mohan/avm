@@ -1746,6 +1746,7 @@ typedef struct ThreadData {
   // Root node for pre-allocated partition context tree (PC_TREE) reused
   // across superblocks in real-time non-RD mode.
   struct PC_TREE *pc_root;
+  CcsoCtx *ccso_ctx;
 } ThreadData;
 
 struct EncWorkerData;
@@ -1869,9 +1870,19 @@ typedef struct {
   AV2LrSync lr_row_sync;
 
   /*!
+   * CCSO multi-threading object.
+   */
+  AV2CcsoSync ccso_sync;
+
+  /*!
    * Global Motion multi-threading object.
    */
   AV2GlobalMotionSync gm_sync;
+
+  /*!
+   * Ccso search multi-threading object.
+   */
+  AV2CcsoSearchSync ccso_search_sync;
 } MultiThreadInfo;
 
 /*!\cond */

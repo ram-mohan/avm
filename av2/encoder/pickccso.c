@@ -24,6 +24,7 @@
 #include "av2/common/av2_common_int.h"
 #include "av2/common/reconinter.h"
 #include "av2/encoder/encoder.h"
+#include "av2/encoder/ethread.h"
 #include "av2/encoder/pickccso.h"
 
 const int ccso_offset[8] = { -10, -7, -3, -1, 0, 1, 3, 7 };
@@ -35,7 +36,7 @@ static INLINE bool reuse_ccso_class_info(const AV2_COMMON *cm) {
 
 // Resets per-frame state in a persistent CcsoCtx while preserving all
 // allocated buffer pointers and size-tracking fields.
-static void ccso_ctx_reset(CcsoCtx *ctx) {
+void av2_ccso_ctx_reset(CcsoCtx *ctx) {
   memset(ctx, 0, offsetof(CcsoCtx, class_err_slab));
 }
 
@@ -1161,23 +1162,28 @@ void av2_ccso_alloc_search_buffers(AV2_COMMON *cm, CcsoCtx *ctx,
   }
 }
 
+void av2_free_ccso_search_buffers(CcsoCtx *ctx) {
+  if (ctx) {
+    avm_free(ctx->class_err_slab);
+    avm_free(ctx->class_cnt_slab);
+    avm_free(ctx->class_err_bo_slab);
+    avm_free(ctx->class_cnt_bo_slab);
+    avm_free(ctx->reuse_class_err_slab);
+    avm_free(ctx->reuse_class_cnt_slab);
+    avm_free(ctx->training_dist_block);
+    avm_free(ctx->filter_control);
+    avm_free(ctx->best_filter_control);
+    avm_free(ctx->final_filter_control);
+    avm_free(ctx->temp_rec_uv_buf);
+    avm_free(ctx->src_cls0);
+    avm_free(ctx->src_cls1);
+  }
+}
+
 // Frees all persistent CCSO encoder buffers (pixel buffers + RDO scratch).
 // Call once at encoder close via av2_remove_compressor.
 void av2_ccso_ctx_free(AV2_COMP *cpi) {
-  CcsoCtx *ctx = &cpi->ccso_ctx;
-  avm_free(ctx->class_err_slab);
-  avm_free(ctx->class_cnt_slab);
-  avm_free(ctx->class_err_bo_slab);
-  avm_free(ctx->class_cnt_bo_slab);
-  avm_free(ctx->reuse_class_err_slab);
-  avm_free(ctx->reuse_class_cnt_slab);
-  avm_free(ctx->training_dist_block);
-  avm_free(ctx->filter_control);
-  avm_free(ctx->best_filter_control);
-  avm_free(ctx->final_filter_control);
-  avm_free(ctx->temp_rec_uv_buf);
-  avm_free(ctx->src_cls0);
-  avm_free(ctx->src_cls1);
+  av2_free_ccso_search_buffers(&cpi->ccso_ctx);
   avm_free(cpi->unfiltered_dist_block);
   avm_free(cpi->ccso_ext_rec_y);
   for (int plane = 0; plane < CCSO_NUM_COMPONENTS; ++plane) {
@@ -1273,6 +1279,7 @@ static AVM_INLINE void run_training(AV2_COMMON *cm, CcsoCtx *ctx,
                        (1 << ctx->max_band_log2) * 16);
         ctx->best.edge_classifier = ctx->edge_clf;
         ctx->best.band_log2 = ctx->max_band_log2;
+        ctx->best.job_idx = ctx->job_idx;
         av2_copy_array(ctx->best_filter_control, ctx->filter_control,
                        s->sb_count);
       }
@@ -1509,6 +1516,45 @@ static void set_mbmi_ccso_blk(MB_MODE_INFO *mbmi, int plane, uint8_t val) {
   }
 }
 
+// Builds the flat list of (scale_idx, ccso_bo_only, ext_filter_support,
+// quant_idx) combinations searched by derive_ccso_filter(), in the same
+// order the single-threaded search would visit them. Returns the number of
+// jobs written to `job_list`, which must hold at least CCSO_SEARCH_PARAM_COUNT
+// entries.
+int av2_ccso_build_search_job_list(CcsoSearchJobInfo *job_list,
+                                   int early_terminate_ccso_search) {
+  const int total_scale_idx = 4;
+  const int total_filter_support = 7;
+  const int total_quant_idx = 4;
+  int num_jobs = 0;
+
+  for (uint8_t scale_idx = 0; scale_idx < total_scale_idx; ++scale_idx) {
+    for (uint8_t search_idx = 0; search_idx < 2; ++search_idx) {
+      // A BO-only candidate is cheaper and covers a different part of the
+      // search space. For early termination, evaluate it first so the full
+      // filter search starts with a finite RD bound. This order should not
+      // affect the result of exhaustive search.
+      const uint8_t ccso_bo_only =
+          early_terminate_ccso_search ? 1 - search_idx : search_idx;
+      int num_filter_iter = ccso_bo_only ? 1 : total_filter_support;
+      for (uint8_t ext_filter_support = 0; ext_filter_support < num_filter_iter;
+           ++ext_filter_support) {
+        uint8_t num_quant_iter = ccso_bo_only ? 1 : total_quant_idx;
+        for (uint8_t quant_idx = 0; quant_idx < num_quant_iter; ++quant_idx) {
+          assert(num_jobs < CCSO_SEARCH_PARAM_COUNT);
+          job_list[num_jobs].scale_idx = scale_idx;
+          job_list[num_jobs].ccso_bo_only = ccso_bo_only;
+          job_list[num_jobs].ext_filter_support = ext_filter_support;
+          job_list[num_jobs].quant_idx = quant_idx;
+          job_list[num_jobs].job_idx = num_jobs;
+          ++num_jobs;
+        }
+      }
+    }
+  }
+  return num_jobs;
+}
+
 static void finalize_ccso_plane(AV2_COMMON *cm, CcsoCtx *ctx, ThreadData *td,
                                 int disable_ccso) {
   CcsoInfo *cur_frame_ccso_info = &cm->cur_frame->ccso_info;
@@ -1683,10 +1729,6 @@ static void derive_ccso_filter(AV2_COMP *cpi, const int plane,
       (1 << log2_filter_unit_size_x >> 2);
   const int sb_count = ccso_nvfb * ccso_nhfb;
 
-  const int total_scale_idx = 4;
-  const int total_filter_support = 7;
-  const int total_quant_idx = 4;
-
   uint8_t frame_bits = 1;  // ccso_planes[ plane ]
   frame_bits += 1;         // ccso_bo_only[ plane ]
   frame_bits += 2;         // ccso_scale_idx[ plane ]
@@ -1727,7 +1769,7 @@ static void derive_ccso_filter(AV2_COMP *cpi, const int plane,
   }
   // alloc ccso search context
   CcsoCtx *ctx = &cpi->ccso_ctx;
-  ccso_ctx_reset(ctx);
+  av2_ccso_ctx_reset(ctx);
   av2_ccso_alloc_search_buffers(cm, ctx, ccso_stride,
                                 xd->plane[AVM_PLANE_Y].dst.height, sb_count);
 
@@ -1754,6 +1796,7 @@ static void derive_ccso_filter(AV2_COMP *cpi, const int plane,
 
   ctx->final.filtered_cost = UINT64_MAX;
   ctx->final.ref_idx = -1;
+  ctx->final.job_idx = INT32_MAX;
   ctx->ccso_stride = ccso_stride;
   ctx->ccso_stride_ext = ccso_stride + (CCSO_PADDING_SIZE << 1);
 
@@ -1765,29 +1808,22 @@ static void derive_ccso_filter(AV2_COMP *cpi, const int plane,
   const uint64_t best_unfiltered_cost =
       RDCOST(rdmult, av2_cost_literal(1), unfiltered_dist_frame * 16);
 
-  for (uint8_t scale_idx = 0; scale_idx < total_scale_idx; ++scale_idx) {
-    for (uint8_t search_idx = 0; search_idx < 2; search_idx++) {
-      // A BO-only candidate is cheaper and covers a different part of the
-      // search space. Under early termination, evaluate it first so the full
-      // filter search starts with a finite RD bound. Keep the original order
-      // for exhaustive search, where ordering should not affect the result.
-      const uint8_t ccso_bo_only =
-          early_terminate_ccso_search ? 1 - search_idx : search_idx;
-      const int num_filter_iter = ccso_bo_only ? 1 : total_filter_support;
-      for (uint8_t ext_filter_support = 0; ext_filter_support < num_filter_iter;
-           ++ext_filter_support) {
-        const uint8_t num_quant_iter = ccso_bo_only ? 1 : total_quant_idx;
-        for (uint8_t quant_idx = 0; quant_idx < num_quant_iter; ++quant_idx) {
-          ctx->scale_idx = scale_idx;
-          ctx->ccso_bo_only = ccso_bo_only;
-          ctx->ext_filter_support = ext_filter_support;
-          ctx->quant_idx = quant_idx;
-          if (av2_ccso_param_search(cm, ctx, xd)) goto exit_loops;
-        }
-      }
+  // Multi-threading the parameter search is only safe when early termination
+  // is disabled: the early-exit check inside av2_ccso_param_search() compares
+  // against the best cost found so far, an ordering guarantee that doesn't
+  // hold once jobs run out of sequence across threads.
+  if (!early_terminate_ccso_search && cpi->mt_info.num_workers > 1) {
+    av2_ccso_search_mt(cpi, ccso_stride, xd->plane[AVM_PLANE_Y].dst.height,
+                       sb_count);
+  } else {
+    CcsoSearchJobInfo param_list[CCSO_SEARCH_PARAM_COUNT];
+    const int total_params =
+        av2_ccso_build_search_job_list(param_list, early_terminate_ccso_search);
+    for (int param_idx = 0; param_idx < total_params; ++param_idx) {
+      av2_ccso_ctx_load_job(ctx, &param_list[param_idx]);
+      if (av2_ccso_param_search(cm, ctx, xd)) break;
     }
   }
-exit_loops:
 
   finalize_ccso_plane(cm, ctx, td,
                       best_unfiltered_cost < ctx->final.filtered_cost);

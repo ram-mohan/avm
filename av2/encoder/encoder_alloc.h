@@ -89,6 +89,7 @@ static AVM_INLINE void alloc_compressor_data(AV2_COMP *cpi) {
       av2_alloc_pmc(cm, SHARED_PART, 0, 0, BLOCK_16X16, NULL, PARTITION_NONE, 0,
                     cm->seq_params.subsampling_x, cm->seq_params.subsampling_y,
                     &cpi->td.shared_coeff_buf);
+  cpi->td.ccso_ctx = &cpi->ccso_ctx;
 }
 
 static AVM_INLINE void realloc_segmentation_maps(AV2_COMP *cpi) {

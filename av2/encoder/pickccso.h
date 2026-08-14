@@ -13,6 +13,8 @@
 #ifndef AVM_AV2_ENCODER_PICKCCSO_H_
 #define AVM_AV2_ENCODER_PICKCCSO_H_
 
+#include "avm_util/avm_thread.h"
+
 #include "av2/common/ccso.h"
 #include "av2/encoder/speed_features.h"
 
@@ -25,6 +27,11 @@ extern "C" {
 // Number of (d0, d1, band) combinations spanned by total_class_err/cnt.
 #define CCSO_CLASS_STATS_ENTRIES \
   (CCSO_INPUT_INTERVAL * CCSO_INPUT_INTERVAL * CCSO_BAND_NUM)
+
+// Total number of distinct (scale_idx, ccso_bo_only, ext_filter_support,
+// quant_idx) combinations searched by derive_ccso_filter(): 4 * 7 * 4 for
+// ccso_bo_only == 0, plus 4 for ccso_bo_only == 1.
+#define CCSO_SEARCH_PARAM_COUNT ((4 * 7 * 4) + 4)
 
 typedef struct {
   const uint16_t *org_uv;
@@ -59,6 +66,12 @@ typedef struct {
   uint8_t quant_idx;
   uint8_t ccso_bo_only;
   uint8_t edge_classifier;
+  // If two search coordinates produce same filtered cost, in single thread mode
+  // the earlier searched coordinate is chosen. In multi thread mode this
+  // variable keeps track of this information so that behaviour can be
+  // maintained consistent across threads. In single thread mode, this field has
+  // no role.
+  int job_idx;
 } CcsoCandidate;
 
 typedef struct {
@@ -81,6 +94,7 @@ typedef struct {
   uint8_t reuse_ccso_idx;
   uint8_t sb_reuse_idx;
   int ref_idx;
+  int job_idx;
 
   uint8_t max_edge_interval;
   uint8_t num_band_iter;
@@ -107,8 +121,8 @@ typedef struct {
   int *reuse_total_class_cnt[CCSO_INPUT_INTERVAL][CCSO_INPUT_INTERVAL]
                             [CCSO_BAND_NUM];
 
-  // Persistent fields — survive across frames; ccso_ctx_reset zeros everything
-  // above this boundary via offsetof(CcsoCtx, class_err_slab).
+  // Persistent fields — survive across frames; av2_ccso_ctx_reset zeros
+  // everything above this boundary via offsetof(CcsoCtx, class_err_slab).
   // Adding a new allocated pointer: place it here and free it in
   // av2_ccso_ctx_free. Adding a new per-frame field: place it above.
   int *class_err_slab;        // backs total_class_err
@@ -129,7 +143,48 @@ typedef struct {
   size_t alloc_luma_size;
 } CcsoCtx;
 
+typedef struct {
+  uint8_t scale_idx;
+  uint8_t ccso_bo_only;
+  uint8_t ext_filter_support;
+  uint8_t quant_idx;
+  int job_idx;
+} CcsoSearchJobInfo;
+
+typedef struct {
+  // List of jobs to be processed by the workers, and the index of the next
+  // job to be dequeued.
+  CcsoSearchJobInfo job_list[CCSO_SEARCH_PARAM_COUNT];
+  int total_jobs;
+  int next_job;
+
+#if CONFIG_MULTITHREAD
+  // Mutex lock used while dispatching jobs.
+  pthread_mutex_t *mutex_;
+#endif
+} AV2CcsoSearchSync;
+
+static AVM_INLINE void av2_ccso_ctx_load_job(CcsoCtx *ctx,
+                                             const CcsoSearchJobInfo *job) {
+  ctx->scale_idx = job->scale_idx;
+  ctx->ccso_bo_only = job->ccso_bo_only;
+  ctx->ext_filter_support = job->ext_filter_support;
+  ctx->quant_idx = job->quant_idx;
+  ctx->job_idx = job->job_idx;
+}
+
+void av2_ccso_alloc_search_buffers(AV2_COMMON *cm, CcsoCtx *ctx,
+                                   int ccso_stride, int ccso_height,
+                                   int sb_count);
+
+void av2_free_ccso_search_buffers(CcsoCtx *ctx);
+
 void av2_ccso_ctx_free(struct AV2_COMP *cpi);
+
+void av2_ccso_ctx_reset(CcsoCtx *ctx);
+
+int av2_ccso_build_search_job_list(CcsoSearchJobInfo *job_list,
+                                   int early_terminate_ccso_search);
 
 bool av2_ccso_param_search(AV2_COMMON *cm, CcsoCtx *ctx, MACROBLOCKD *xd);
 
