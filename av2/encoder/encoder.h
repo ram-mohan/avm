@@ -1870,6 +1870,11 @@ typedef struct {
   AV2LrSync lr_row_sync;
 
   /*!
+   * CCSO multi-threading object.
+   */
+  AV2CcsoSync ccso_sync;
+
+  /*!
    * Global Motion multi-threading object.
    */
   AV2GlobalMotionSync gm_sync;
