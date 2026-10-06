@@ -1515,17 +1515,6 @@ static int compute_wienerns_filter_select_master(
   return 1;
 }
 
-void av2_accumulate_wienerns_correlation_c(double *A_base, double *b_base,
-                                           const int16_t *buf, int16_t y,
-                                           int num_feat) {
-  for (int k = 0; k < num_feat; ++k) {
-    for (int l = 0; l <= k; ++l) {
-      A_base[k * num_feat + l] += (double)buf[k] * (double)buf[l];
-    }
-    b_base[k] += (double)buf[k] * (double)y;
-  }
-}
-
 // fill wiener predictor variable at a given position for a batch of contiguous
 // pixels
 static void wienerns_accumulate_tap_diff_1xn(int16_t *feat, const uint16_t *nbr,

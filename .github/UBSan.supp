@@ -3,12 +3,6 @@
 # For documentation of the format, see:
 # https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html#issue-suppression
 
-# av2/encoder/x86/pickrst_sse4.c
-alignment:acc_stat_highbd_win7_one_line_sse4_1
-alignment:acc_stat_highbd_win5_one_line_sse4_1
-alignment:acc_stat_win7_one_line_sse4_1
-alignment:acc_stat_win5_one_line_sse4_1
-
 # av2/encoder/x86/rdopt_sse4.c
 alignment:horver_correlation_4x4
 
