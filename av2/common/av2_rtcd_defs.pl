@@ -424,6 +424,18 @@ if (avm_config("CONFIG_AV2_ENCODER") eq "yes") {
   # WienerNS filter stats accumulation
   add_proto qw/void av2_accumulate_wienerns_correlation/, "double *A_base, double *b_base, const int16_t *buf, int16_t y, int num_feat";
   specialize qw/av2_accumulate_wienerns_correlation sse4_1 avx2/;
+
+  add_proto qw/void av2_wienerns_accumulate_tap_diff_1x16/, "int16_t *feat, const uint16_t *nbr, const uint16_t *center";
+  specialize qw/av2_wienerns_accumulate_tap_diff_1x16 avx2/;
+
+  add_proto qw/int64_t av2_wienerns_compute_err_and_sse_mx16/, "int16_t *err, const uint16_t *src, int src_stride, const uint16_t *dgd, int dgd_stride, int num_rows";
+  specialize qw/av2_wienerns_compute_err_and_sse_mx16 avx2/;
+
+  add_proto qw/void av2_wienerns_accumulate_correlation_1x16/, "int64_t *A_base, int64_t *b_base, const int16_t *feat, const int16_t *err, int num_feat";
+  specialize qw/av2_wienerns_accumulate_correlation_1x16 avx2/;
+
+  add_proto qw/void av2_wienerns_accumulate_correlation_4x4/, "int64_t *A_base, int64_t *b_base, const int16_t *feat, const int16_t *err, int num_feat";
+  specialize qw/av2_wienerns_accumulate_correlation_4x4 avx2/;
 }
 
 # WARPED_MOTION / GLOBAL_MOTION functions

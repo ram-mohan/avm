@@ -22,6 +22,10 @@ extern "C" {
 struct yv12_buffer_config;
 struct AV2_COMP;
 
+#define WIENERNS_STATS_BATCH 16
+// additional samples used by AVX2 simd kernels.
+#define WIENERNS_STATS_PAD 3
+
 static INLINE int check_wienerns_eq(const WienerNonsepInfo *info,
                                     const WienerNonsepInfo *ref, int num_coeffs,
                                     int wiener_class_id) {

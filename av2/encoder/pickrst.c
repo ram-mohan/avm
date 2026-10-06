@@ -145,6 +145,10 @@ typedef struct {
   RestorationLineBuffers *rlbs;
   // Temporary storage used by *wienerns_filter* functions.
   double *wienerns_tmpbuf;
+  // Temporary storage used by compute_stats_for_wienerns_filter.
+  int16_t *wienerns_stats_buf;
+  int64_t *wienerns_stats_Ai;
+  int64_t *wienerns_stats_bi;
 
   bool tskip_zero_flag;
 
@@ -1522,29 +1526,127 @@ void av2_accumulate_wienerns_correlation_c(double *A_base, double *b_base,
   }
 }
 
+// fill wiener predictor variable at a given position for a batch of contiguous
+// pixels
+static void wienerns_accumulate_tap_diff_1xn(int16_t *feat, const uint16_t *nbr,
+                                             const uint16_t *center,
+                                             int num_pixels) {
+  for (int l = 0; l < num_pixels; ++l) {
+    feat[l] += (int16_t)nbr[l] - (int16_t)center[l];
+  }
+}
+
+void av2_wienerns_accumulate_tap_diff_1x16_c(int16_t *feat, const uint16_t *nbr,
+                                             const uint16_t *center) {
+  wienerns_accumulate_tap_diff_1xn(feat, nbr, center, 16);
+}
+
+// error signal
+static int64_t wienerns_compute_err_and_sse_1xn(int16_t *err,
+                                                const uint16_t *src,
+                                                const uint16_t *dgd,
+                                                int num_pixels) {
+  int64_t sse = 0;
+  for (int l = 0; l < num_pixels; ++l) {
+    err[l] = (int16_t)src[l] - (int16_t)dgd[l];
+    sse += (int64_t)err[l] * (int64_t)err[l];
+  }
+  return sse;
+}
+
+int64_t av2_wienerns_compute_err_and_sse_mx16_c(int16_t *err,
+                                                const uint16_t *src,
+                                                int src_stride,
+                                                const uint16_t *dgd,
+                                                int dgd_stride, int num_rows) {
+  int64_t sse = 0;
+  for (int i = 0; i < num_rows; ++i) {
+    sse += wienerns_compute_err_and_sse_1xn(err + i * 16, src + i * src_stride,
+                                            dgd + i * dgd_stride, 16);
+  }
+  return sse;
+}
+
+// normal equations formulation using (num_rows_v x num_pixels_h) pixels
+static void wienerns_accumulate_correlation_mxn(
+    int64_t *A_base, int64_t *b_base, const int16_t *feat, const int16_t *err,
+    int num_feat, int num_rows_v, int num_pixels_h) {
+  for (int i = 0; i < num_rows_v; i++) {
+    const int16_t *feat_row =
+        feat + (i * WIENERNS_TAPS_MAX * WIENERNS_STATS_BATCH);
+    for (int j = 0; j < num_pixels_h; j++) {
+      for (int k = 0; k < num_feat; ++k) {
+        const int16_t feat_kj = feat_row[k * WIENERNS_STATS_BATCH + j];
+        for (int l = 0; l <= k; ++l) {
+          A_base[k * num_feat + l] +=
+              (int64_t)feat_kj *
+              (int64_t)feat_row[l * WIENERNS_STATS_BATCH + j];
+        }
+        b_base[k] +=
+            (int64_t)feat_kj * (int64_t)err[i * WIENERNS_STATS_BATCH + j];
+      }
+    }
+  }
+}
+
+void av2_wienerns_accumulate_correlation_1x16_c(int64_t *A_base,
+                                                int64_t *b_base,
+                                                const int16_t *feat,
+                                                const int16_t *err,
+                                                int num_feat) {
+  wienerns_accumulate_correlation_mxn(A_base, b_base, feat, err, num_feat, 1,
+                                      16);
+}
+
+void av2_wienerns_accumulate_correlation_4x4_c(int64_t *A_base, int64_t *b_base,
+                                               const int16_t *feat,
+                                               const int16_t *err,
+                                               int num_feat) {
+  wienerns_accumulate_correlation_mxn(A_base, b_base, feat, err, num_feat, 4,
+                                      4);
+}
+
+static INLINE void wienerns_accumulate_tap_diff(int16_t *feat,
+                                                const uint16_t *nbr,
+                                                const uint16_t *center,
+                                                int num_pixels) {
+  if (num_pixels == 16) {
+    av2_wienerns_accumulate_tap_diff_1x16(feat, nbr, center);
+  } else {
+    wienerns_accumulate_tap_diff_1xn(feat, nbr, center, num_pixels);
+  }
+}
+
+static INLINE int64_t wienerns_compute_err_and_sse(
+    int16_t *err, const uint16_t *src, int src_stride, const uint16_t *dgd,
+    int dgd_stride, int num_rows, int num_pixels) {
+  if (num_pixels == 16) {
+    return av2_wienerns_compute_err_and_sse_mx16(err, src, src_stride, dgd,
+                                                 dgd_stride, num_rows);
+  }
+  int64_t sse = 0;
+  for (int l = 0; l < num_rows; ++l) {
+    sse += wienerns_compute_err_and_sse_1xn(err + l * 16, src + l * src_stride,
+                                            dgd + l * dgd_stride, num_pixels);
+  }
+  return sse;
+}
+
 static int64_t compute_stats_for_wienerns_filter(
     const uint16_t *dgd_hbd, const uint16_t *src_hbd,
     const RestorationTileLimits *limits, int dgd_stride, int src_stride,
-    const RestorationUnitInfo *rui, int bit_depth, double *A, double *b,
+    const RestorationUnitInfo *rui, double *A, double *b,
     int *num_pixels_in_class, const WienernsFilterParameters *nsfilter_params,
-    int num_classes) {
-  (void)rui;
+    int num_classes, int16_t *buf, int64_t *Ai, int64_t *bi) {
   const uint16_t *luma_hbd = rui->luma;
 
-  const int total_dim_A = num_classes * WIENERNS_TAPS_MAX * WIENERNS_TAPS_MAX;
   const int stride_A = WIENERNS_TAPS_MAX * WIENERNS_TAPS_MAX;
-  const int total_dim_b = num_classes * WIENERNS_TAPS_MAX;
   const int stride_b = WIENERNS_TAPS_MAX;
 
   const int set_index =
       get_filter_set_index(rui->base_qindex, rui->qindex_offset);
   const uint8_t *pc_wiener_sub_classify =
       get_pc_wiener_sub_classifier(num_classes, set_index);
-
-  int16_t buf[WIENERNS_TAPS_MAX];
-  memset(A, 0, sizeof(*A) * total_dim_A);
-  memset(b, 0, sizeof(*b) * total_dim_b);
-  memset(num_pixels_in_class, 0, sizeof(*num_pixels_in_class) * num_classes);
 
   const int(*wienerns_config)[3] = nsfilter_params->nsfilter_config.config;
   int is_uv = (rui->plane != AVM_PLANE_Y);
@@ -1554,71 +1656,112 @@ static int64_t compute_stats_for_wienerns_filter(
                                     nsfilter_params->nsfilter_config.num_pixels2
                               : nsfilter_params->nsfilter_config.num_pixels;
   const int num_feat = nsfilter_params->ncoeffs;
+  const int row_step = is_uv ? 1 : MI_SIZE;
+  const int buf_stride = WIENERNS_TAPS_MAX * WIENERNS_STATS_BATCH;
 
-  int64_t real_sse = 0;  // for debuggung purposes
-  // Single raster pass: each pixel only contributes to the statistics of its
-  // own class. The per-class accumulation order is the same raster order as
-  // a separate pass per class, so the results are identical.
-  for (int i = limits->v_start; i < limits->v_end; ++i) {
-    for (int j = limits->h_start; j < limits->h_end; ++j) {
-      int dgd_id = i * dgd_stride + j;
-      int src_id = i * src_stride + j;
+  for (int c_id = 0; c_id < num_classes; ++c_id) {
+    av2_zero_array(Ai + c_id * stride_A, num_feat * num_feat);
+    av2_zero_array(bi + c_id * stride_b, num_feat);
+  }
+  av2_zero_array(num_pixels_in_class, num_classes);
 
-      int c_id = 0;
-      if (num_classes > 1) {
-        const int full_class_id =
-            rui->wiener_class_id[(i >> MI_SIZE_LOG2) *
-                                     rui->wiener_class_id_stride +
-                                 (j >> MI_SIZE_LOG2)];
-        c_id = pc_wiener_sub_classify[full_class_id];
-        // Skip pixels not belonging to any of the classes.
-        if (c_id >= num_classes) continue;
+  assert(!is_uv || num_classes == 1);
+  assert(is_uv || ((limits->v_start | limits->h_start) & (MI_SIZE - 1)) == 0);
+
+  int64_t real_sse = 0;
+  for (int i = limits->v_start; i < limits->v_end; i += row_step) {
+    const int limit_v_end = AVMMIN(row_step, limits->v_end - i);
+    for (int j = limits->h_start; j < limits->h_end;
+         j += WIENERNS_STATS_BATCH) {
+      const int limit_h_end = AVMMIN(WIENERNS_STATS_BATCH, limits->h_end - j);
+      const bool is_batch_full_size = (limit_h_end == WIENERNS_STATS_BATCH);
+      for (int l = 0; l < row_step; l++) {
+        av2_zero_array(&buf[l * buf_stride], num_feat * WIENERNS_STATS_BATCH);
       }
-
-      int luma_id = i * rui->luma_stride + j;
-      memset(buf, 0, sizeof(buf));
-      for (int k = 0; k < end_pixel; ++k) {
-        const int cross =
-            (is_uv && k >= nsfilter_params->nsfilter_config.num_pixels);
-
-        if (!cross) {
-          const int pos = wienerns_config[k][WIENERNS_BUF_POS];
-          const int r = wienerns_config[k][WIENERNS_ROW_ID];
-          const int c = wienerns_config[k][WIENERNS_COL_ID];
-          if (r == 0 && c == 0) {
-            buf[pos] += 1;
-            continue;
+      for (int k = 0; k < nsfilter_params->nsfilter_config.num_pixels; ++k) {
+        const int pos = wienerns_config[k][WIENERNS_BUF_POS];
+        const int r = wienerns_config[k][WIENERNS_ROW_ID];
+        const int c = wienerns_config[k][WIENERNS_COL_ID];
+        if (r == 0 && c == 0) {
+          for (int l = 0; l < limit_v_end; l++) {
+            int16_t *center = &buf[l * buf_stride + pos * WIENERNS_STATS_BATCH];
+            for (int m = 0; m < limit_h_end; m++) {
+              center[m] += 1;
+            }
           }
-          buf[pos] +=
-              clip_base((int16_t)dgd_hbd[(i + r) * dgd_stride + (j + c)] -
-                            (int16_t)dgd_hbd[dgd_id],
-                        bit_depth);
         } else {
-          const int k2 = k - nsfilter_params->nsfilter_config.num_pixels;
-          const int pos = wienerns_config2[k2][WIENERNS_BUF_POS];
-          const int r = wienerns_config2[k2][WIENERNS_ROW_ID];
-          const int c = wienerns_config2[k2][WIENERNS_COL_ID];
-
-          buf[pos] += clip_base(
-              (int16_t)luma_hbd[(i + r) * rui->luma_stride + (j + c)] -
-                  (int16_t)luma_hbd[luma_id],
-              bit_depth);
+          for (int l = 0; l < limit_v_end; l++) {
+            wienerns_accumulate_tap_diff(
+                &buf[l * buf_stride + pos * WIENERNS_STATS_BATCH],
+                &dgd_hbd[(i + l + r) * dgd_stride + (j + c)],
+                &dgd_hbd[(i + l) * dgd_stride + j], limit_h_end);
+          }
         }
       }
-      int16_t y;
-      y = ((int64_t)src_hbd[src_id] - dgd_hbd[dgd_id]);
-      av2_accumulate_wienerns_correlation(
-          A + c_id * stride_A, b + c_id * stride_b, buf, y, num_feat);
-      real_sse += (int64_t)y * (int64_t)y;
-      ++num_pixels_in_class[c_id];
+      for (int k = 0;
+           k < end_pixel - nsfilter_params->nsfilter_config.num_pixels; ++k) {
+        const int pos = wienerns_config2[k][WIENERNS_BUF_POS];
+        const int r = wienerns_config2[k][WIENERNS_ROW_ID];
+        const int c = wienerns_config2[k][WIENERNS_COL_ID];
+        wienerns_accumulate_tap_diff(
+            &buf[pos * WIENERNS_STATS_BATCH],
+            &luma_hbd[(i + r) * rui->luma_stride + (j + c)],
+            &luma_hbd[i * rui->luma_stride + j], limit_h_end);
+      }
+      int16_t err[MI_SIZE][WIENERNS_STATS_BATCH];
+      if (!is_batch_full_size || limit_v_end < row_step) {
+        av2_zero_array(&err[0][0], row_step * WIENERNS_STATS_BATCH);
+      }
+      real_sse += wienerns_compute_err_and_sse(
+          &err[0][0], &src_hbd[i * src_stride + j], src_stride,
+          &dgd_hbd[i * dgd_stride + j], dgd_stride, limit_v_end, limit_h_end);
+      if (is_uv) {
+        av2_wienerns_accumulate_correlation_1x16(Ai, bi, buf, err[0], num_feat);
+        num_pixels_in_class[0] += limit_h_end;
+      } else {
+        const uint8_t *class_id =
+            &rui->wiener_class_id[(i >> MI_SIZE_LOG2) *
+                                      rui->wiener_class_id_stride +
+                                  (j >> MI_SIZE_LOG2)];
+        int sub_class_id_arr[4] = { -1, -1, -1, -1 };
+        for (int m = 0; m < limit_h_end; m += MI_SIZE) {
+          sub_class_id_arr[m >> MI_SIZE_LOG2] =
+              pc_wiener_sub_classify[class_id[m >> MI_SIZE_LOG2]];
+        }
+        if (is_batch_full_size && sub_class_id_arr[0] == sub_class_id_arr[1] &&
+            sub_class_id_arr[0] == sub_class_id_arr[2] &&
+            sub_class_id_arr[0] == sub_class_id_arr[3]) {
+          for (int l = 0; l < limit_v_end; ++l) {
+            av2_wienerns_accumulate_correlation_1x16(
+                Ai + sub_class_id_arr[0] * stride_A,
+                bi + sub_class_id_arr[0] * stride_b, &buf[l * buf_stride],
+                err[l], num_feat);
+            num_pixels_in_class[sub_class_id_arr[0]] += limit_h_end;
+          }
+        } else {
+          for (int m = 0; m < limit_h_end; m += MI_SIZE) {
+            const int num_pixels_h = AVMMIN(MI_SIZE, limit_h_end - m);
+            const int sub_class_id = sub_class_id_arr[m >> MI_SIZE_LOG2];
+            av2_wienerns_accumulate_correlation_4x4(
+                Ai + sub_class_id * stride_A, bi + sub_class_id * stride_b,
+                &buf[m], &err[0][m], num_feat);
+            num_pixels_in_class[sub_class_id] += (num_pixels_h * limit_v_end);
+          }
+        }
+      }
     }
   }
   for (int c_id = 0; c_id < num_classes; ++c_id) {
     for (int k = 0; k < num_feat; ++k) {
-      for (int l = k + 1; l < num_feat; ++l) {
-        A[k * num_feat + l + c_id * stride_A] =
-            A[l * num_feat + k + c_id * stride_A];
+      for (int l = 0; l <= k; ++l) {
+        A[c_id * stride_A + k * num_feat + l] =
+            (double)Ai[c_id * stride_A + k * num_feat + l];
       }
+      for (int l = k + 1; l < num_feat; ++l) {
+        A[c_id * stride_A + k * num_feat + l] =
+            (double)Ai[c_id * stride_A + l * num_feat + k];
+      }
+      b[c_id * stride_b + k] = (double)bi[c_id * stride_b + k];
     }
   }
   return real_sse;
@@ -1895,6 +2038,9 @@ double accumulate_merge_stats(const RestSearchCtxt *rsc,
   return cost_nomerge_cand;
 }
 
+#define RU_ON_WEIGHT 1
+#define RU_OFF_WEIGHT 1e-10
+
 static void gather_stats_wienerns(const RestorationTileLimits *limits,
                                   const AV2PixelRect *tile_rect,
                                   int rest_unit_idx,
@@ -1915,24 +2061,28 @@ static void gather_stats_wienerns(const RestorationTileLimits *limits,
   assert(rsc->num_filter_classes == rsc->wienerns_bank.filter[0].num_classes);
 
   set_rui_mbmi_index(rsc, limits, &rui);
-  // Calculate and save this RU's stats.
-  RstUnitStats unit_stats;
-  memset(&unit_stats, 0, sizeof(unit_stats));
+  if (avm_vector_resize(rsc->wienerns_stats, rsc->wienerns_stats->size + 1) ==
+      VECTOR_ERROR)
+    return;
+  RstUnitStats *unit_stats =
+      (RstUnitStats *)avm_vector_back(rsc->wienerns_stats);
   RestUnitSearchInfo *rusi = &rsc->rusi[rest_unit_idx];
-  unit_stats.real_sse = 0;
   if (!rusi->bru_unit_skipped) {
-    unit_stats.real_sse = compute_stats_for_wienerns_filter(
+    unit_stats->real_sse = compute_stats_for_wienerns_filter(
         rsc->dgd_buffer, rsc->src_buffer, limits, rsc->dgd_stride,
-        rsc->src_stride, &rui, rsc->cm->seq_params.bit_depth, unit_stats.A,
-        unit_stats.b, unit_stats.num_pixels_in_class, nsfilter_params,
-        rsc->num_stats_classes);
+        rsc->src_stride, &rui, unit_stats->A, unit_stats->b,
+        unit_stats->num_pixels_in_class, nsfilter_params,
+        rsc->num_stats_classes, rsc->wienerns_stats_buf, rsc->wienerns_stats_Ai,
+        rsc->wienerns_stats_bi);
+  } else {
+    memset(unit_stats, 0, sizeof(*unit_stats));
   }
-  unit_stats.ru_idx = rest_unit_idx;
-  unit_stats.ru_idx_in_tile = rest_unit_idx_in_rutile - rsc->ru_idx_base;
-  unit_stats.limits = *limits;
-  unit_stats.plane = rsc->plane;
-  unit_stats.num_stats_classes = rsc->num_stats_classes;
-  avm_vector_push_back(rsc->wienerns_stats, &unit_stats);
+  unit_stats->weight = RU_ON_WEIGHT;
+  unit_stats->ru_idx = rest_unit_idx;
+  unit_stats->ru_idx_in_tile = rest_unit_idx_in_rutile - rsc->ru_idx_base;
+  unit_stats->limits = *limits;
+  unit_stats->plane = rsc->plane;
+  unit_stats->num_stats_classes = rsc->num_stats_classes;
   return;
 }
 
@@ -2767,7 +2917,12 @@ static void gather_stats_rest_type(RestSearchCtxt *rsc, RestorationType rtype) {
   static const rest_unit_visitor_t funs[RESTORE_TYPES] = {
     NULL, NULL, gather_stats_wienerns, NULL
   };
-  if (rtype == RESTORE_WIENER_NONSEP) avm_vector_clear(rsc->wienerns_stats);
+  if (rtype == RESTORE_WIENER_NONSEP) {
+    const RestorationInfo *rsi = &rsc->cm->rst_info[rsc->plane];
+    avm_vector_clear(rsc->wienerns_stats);
+    avm_vector_reserve(rsc->wienerns_stats,
+                       rsi->horz_units_per_frame * rsi->vert_units_per_frame);
+  }
 
   if (funs[rtype]) process_by_rutile(rsc, funs[rtype]);
 }
@@ -2840,39 +2995,47 @@ const uint8_t *get_class_converter(const RestSearchCtxt *rsc,
 // target_classes < num_classes (without recalculating stats from data). This is
 // possible since the classification design resuls in class labels over a tree
 // having WIENERNS_MAX_CLASSES leaves reduced to the single-class root.
-static void collapse_stats_to_target_classes(int target_classes,
+static void collapse_stats_to_target_classes(int target_classes, int num_feat,
                                              const uint8_t *class_converter,
                                              RstUnitStats *unit_stats) {
-  assert(unit_stats->num_stats_classes >= target_classes);
-  if (unit_stats->num_stats_classes == target_classes) return;
-
-  // TODO: Reduce buffer/copy size.
-  RstUnitStats collapsed_unit_stats;
-  memset(&collapsed_unit_stats, 0, sizeof(collapsed_unit_stats));
-  collapsed_unit_stats.ru_idx = unit_stats->ru_idx;
-  collapsed_unit_stats.ru_idx_in_tile = unit_stats->ru_idx_in_tile;
-  collapsed_unit_stats.plane = unit_stats->plane;
-  collapsed_unit_stats.real_sse = unit_stats->real_sse;
-  collapsed_unit_stats.limits = unit_stats->limits;
-  collapsed_unit_stats.weight = unit_stats->weight;
-  collapsed_unit_stats.num_stats_classes = target_classes;
+  const int num_classes = unit_stats->num_stats_classes;
+  assert(num_classes >= target_classes);
+  if (num_classes == target_classes) return;
 
   const int stride_A = WIENERNS_TAPS_MAX * WIENERNS_TAPS_MAX;
   const int stride_b = WIENERNS_TAPS_MAX;
-  for (int c_id = 0; c_id < unit_stats->num_stats_classes; ++c_id) {
+  const int dim_A = num_feat * num_feat;
+  double A[WIENERNS_R_SIZE];
+  double b[WIENERNS_B_SIZE];
+  int num_pixels[WIENERNS_MAX_CLASSES];
+  av2_zero_array(A, target_classes * dim_A);
+  av2_zero_array(b, target_classes * num_feat);
+  av2_zero_array(num_pixels, target_classes);
+  for (int c_id = 0; c_id < num_classes; ++c_id) {
     const int tc_id = class_converter[c_id];
-    for (int i = 0; i < stride_A; ++i) {
-      collapsed_unit_stats.A[tc_id * stride_A + i] +=
-          unit_stats->A[c_id * stride_A + i];
+    assert(tc_id < target_classes);
+    for (int i = 0; i < dim_A; ++i) {
+      A[tc_id * dim_A + i] += unit_stats->A[c_id * stride_A + i];
     }
-    for (int i = 0; i < stride_b; ++i) {
-      collapsed_unit_stats.b[tc_id * stride_b + i] +=
-          unit_stats->b[c_id * stride_b + i];
+    for (int i = 0; i < num_feat; ++i) {
+      b[tc_id * num_feat + i] += unit_stats->b[c_id * stride_b + i];
     }
-    collapsed_unit_stats.num_pixels_in_class[tc_id] +=
-        unit_stats->num_pixels_in_class[c_id];
+    num_pixels[tc_id] += unit_stats->num_pixels_in_class[c_id];
   }
-  *unit_stats = collapsed_unit_stats;
+
+  for (int c_id = 0; c_id < target_classes; ++c_id) {
+    memcpy(&unit_stats->A[c_id * stride_A], &A[c_id * dim_A],
+           dim_A * sizeof(*A));
+    memcpy(&unit_stats->b[c_id * stride_b], &b[c_id * num_feat],
+           num_feat * sizeof(*b));
+    unit_stats->num_pixels_in_class[c_id] = num_pixels[c_id];
+  }
+  for (int c_id = target_classes; c_id < num_classes; ++c_id) {
+    av2_zero_array(&unit_stats->A[c_id * stride_A], dim_A);
+    av2_zero_array(&unit_stats->b[c_id * stride_b], num_feat);
+    unit_stats->num_pixels_in_class[c_id] = 0;
+  }
+  unit_stats->num_stats_classes = target_classes;
 }
 
 // Initial set of stats are determined using num_stats_classes classes. This
@@ -2882,11 +3045,14 @@ static void collapse_all_stats(RestSearchCtxt *rsc, int num_stats_classes,
                                int num_target_classes) {
   const uint8_t *class_converter =
       get_class_converter(rsc, num_stats_classes, num_target_classes);
+  const WienernsFilterParameters *nsfilter_params = get_wienerns_parameters(
+      rsc->cm->quant_params.base_qindex, rsc->plane != AVM_PLANE_Y);
+  const int num_feat = nsfilter_params->ncoeffs;
   VECTOR_FOR_EACH(rsc->wienerns_stats, unit_stats) {
     RstUnitStats *unit_stats_ptr = (RstUnitStats *)unit_stats.pointer;
     assert(unit_stats_ptr->num_stats_classes == num_stats_classes);
-    collapse_stats_to_target_classes(num_target_classes, class_converter,
-                                     unit_stats_ptr);
+    collapse_stats_to_target_classes(num_target_classes, num_feat,
+                                     class_converter, unit_stats_ptr);
   }
 }
 
@@ -2915,17 +3081,24 @@ static int count_classes_with_no_pixels(const RestSearchCtxt *rsc) {
 // frame-level Wiener filters.
 static void weighted_sum_all_stats(const RestSearchCtxt *rsc,
                                    RstUnitStats *sum_stats, int num_feat) {
-  memset(sum_stats, 0, sizeof(*sum_stats));
-
   // Get a sample to fill the basic fields of sum_stats;
   const RstUnitStats *sample_stat =
       avm_vector_begin(rsc->wienerns_stats).pointer;
   sum_stats->ru_idx = sample_stat->ru_idx;
   sum_stats->plane = sample_stat->plane;
   sum_stats->num_stats_classes = sample_stat->num_stats_classes;
+  sum_stats->ru_idx_in_tile = 0;
+  sum_stats->limits = sample_stat->limits;
+  sum_stats->real_sse = 0;
+  sum_stats->weight = 0;
 
   const int stride_A = WIENERNS_TAPS_MAX * WIENERNS_TAPS_MAX;
   const int stride_b = WIENERNS_TAPS_MAX;
+  for (int c_id = 0; c_id < sum_stats->num_stats_classes; ++c_id) {
+    av2_zero_array(sum_stats->A + c_id * stride_A, num_feat * num_feat);
+    av2_zero_array(sum_stats->b + c_id * stride_b, num_feat);
+  }
+  av2_zero_array(sum_stats->num_pixels_in_class, WIENERNS_MAX_CLASSES);
   VECTOR_FOR_EACH(rsc->wienerns_stats, unit_stats) {
     const RstUnitStats *unit_stat = (const RstUnitStats *)unit_stats.pointer;
     const double weight = unit_stat->weight;
@@ -3087,9 +3260,6 @@ static void solve_filters_from_stats_wienerns(const RestSearchCtxt *rsc,
     }
   }
 }
-
-#define RU_ON_WEIGHT 1
-#define RU_OFF_WEIGHT 1e-10
 
 // Calculates the cost of using frame-level filters on a picture by
 //   (i) determining per RU on-off mode based on R-D,
@@ -3309,13 +3479,6 @@ static double optimize_frame_filters_for_target_classes(
   return best_cost;
 }
 
-static AVM_INLINE void initialize_stat_weights(RestSearchCtxt *rsc) {
-  VECTOR_FOR_EACH(rsc->wienerns_stats, unit_stats) {
-    RstUnitStats *unit_stats_ptr = (RstUnitStats *)(unit_stats.pointer);
-    unit_stats_ptr->weight = RU_ON_WEIGHT;
-  }
-}
-
 #define USE_FINER_TILE 1
 
 #if USE_FINER_TILE
@@ -3401,7 +3564,6 @@ static void find_optimal_num_classes_and_frame_filters(RestSearchCtxt *rsc) {
   int best_utilization = 0;
   int best_num_classes = -1;
   int num_stats_classes = rsc->num_stats_classes;
-  initialize_stat_weights(rsc);
   rsc->temporal_pred_flag = 0;
   for (int i = 0; i < num_try; ++i) {
     const int num_target_classes = num_classes_to_try[i];
@@ -3863,6 +4025,20 @@ static RestSearchCtxt *alloc_rst_search_context(AV2_COMP *const cpi,
   CHECK_MEM_ERROR(cm, wienerns_tmpbuf,
                   avm_malloc(WIENERNS_TMPBUF_SIZE * sizeof(*wienerns_tmpbuf)));
 
+  int16_t *wienerns_stats_buf;
+  CHECK_MEM_ERROR(
+      cm, wienerns_stats_buf,
+      avm_malloc(MI_SIZE * WIENERNS_TAPS_MAX * WIENERNS_STATS_BATCH *
+                 sizeof(*wienerns_stats_buf)));
+  int64_t *wienerns_stats_Ai;
+  CHECK_MEM_ERROR(cm, wienerns_stats_Ai,
+                  avm_malloc((WIENERNS_R_SIZE + WIENERNS_STATS_PAD) *
+                             sizeof(*wienerns_stats_Ai)));
+  int64_t *wienerns_stats_bi;
+  CHECK_MEM_ERROR(cm, wienerns_stats_bi,
+                  avm_malloc((WIENERNS_B_SIZE + WIENERNS_STATS_PAD) *
+                             sizeof(*wienerns_stats_bi)));
+
   RestSearchCtxt *rsc;
   CHECK_MEM_ERROR(cm, rsc, avm_malloc(sizeof(*rsc)));
   rsc->src = src;
@@ -3880,6 +4056,9 @@ static RestSearchCtxt *alloc_rst_search_context(AV2_COMP *const cpi,
   rsc->luma_stride = ns_luma_stride;
   rsc->rlbs = rlbs;
   rsc->wienerns_tmpbuf = wienerns_tmpbuf;
+  rsc->wienerns_stats_buf = wienerns_stats_buf;
+  rsc->wienerns_stats_Ai = wienerns_stats_Ai;
+  rsc->wienerns_stats_bi = wienerns_stats_bi;
   rsc->unit_stack = unit_stack;
   rsc->unit_indices = unit_indices;
 
@@ -3892,6 +4071,9 @@ static void free_rst_search_context(RestSearchCtxt *rsc) {
   avm_free(rsc->luma_buf);
   av2_free_restoration_line_buffers(rsc->rlbs);
   avm_free(rsc->wienerns_tmpbuf);
+  avm_free(rsc->wienerns_stats_buf);
+  avm_free(rsc->wienerns_stats_Ai);
+  avm_free(rsc->wienerns_stats_bi);
   avm_vector_destroy(rsc->wienerns_stats);
   avm_free(rsc->wienerns_stats);
   avm_vector_destroy(rsc->unit_stack);
