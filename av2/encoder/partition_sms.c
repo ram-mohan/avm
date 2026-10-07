@@ -280,6 +280,8 @@ static float sms_w1_t[SMS_N_BSIZE_SLOTS]
                      [SMS_UNIFIED_IN_DIM * SMS_UNIFIED_H1_DIM];
 static float sms_w2_t[SMS_N_BSIZE_SLOTS]
                      [SMS_UNIFIED_H1_DIM * SMS_UNIFIED_H2_DIM];
+static float sms_w3_t[SMS_N_BSIZE_SLOTS]
+                     [SMS_UNIFIED_N_CLASSES * SMS_UNIFIED_H2_DIM];
 
 static void transpose_weights(const float *w, int num_out, int num_in,
                               float *w_t) {
@@ -294,6 +296,8 @@ static void init_sms_nn_weights_t(void) {
                       sms_w1_t[s]);
     transpose_weights(cfg->weights[1], SMS_UNIFIED_H2_DIM, SMS_UNIFIED_H1_DIM,
                       sms_w2_t[s]);
+    transpose_weights(cfg->weights[2], SMS_UNIFIED_N_CLASSES,
+                      SMS_UNIFIED_H2_DIM, sms_w3_t[s]);
   }
 }
 
@@ -306,13 +310,8 @@ static void sms_nn_predict(int slot, const float *feat, float *out) {
                       h1, SMS_UNIFIED_H1_DIM, 1);
   av2_intra_mlp_layer(h1, SMS_UNIFIED_H1_DIM, sms_w2_t[slot], cfg->bias[1], h2,
                       SMS_UNIFIED_H2_DIM, 1);
-  // 10 outputs: not a multiple of the SIMD widths of av2_intra_mlp_layer().
-  for (int o = 0; o < SMS_UNIFIED_N_CLASSES; o++) {
-    float sum = cfg->bias[2][o];
-    for (int i = 0; i < SMS_UNIFIED_H2_DIM; i++)
-      sum += h2[i] * cfg->weights[2][o * SMS_UNIFIED_H2_DIM + i];
-    out[o] = sum;
-  }
+  av2_intra_mlp_layer(h2, SMS_UNIFIED_H2_DIM, sms_w3_t[slot], cfg->bias[2], out,
+                      SMS_UNIFIED_N_CLASSES, 0);
   av2_nn_output_prec_reduce(out, SMS_UNIFIED_N_CLASSES);
 }
 

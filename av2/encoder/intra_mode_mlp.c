@@ -123,13 +123,8 @@ void intra_mode_mlp_predict(const float *features, float *logits) {
                       1);
   av2_intra_mlp_layer(h1, MLP_H1_DIM, mlp_w2, mlp_b2, h2, MLP_H2_DIM, 1);
   av2_intra_mlp_layer(h2, MLP_H2_DIM, mlp_w3, mlp_b3, h3, MLP_H3_DIM, 1);
-  // Layer 4: output dim=13, not a multiple of the SIMD widths above — scalar.
-  for (int i = 0; i < MLP_OUTPUT_DIM; i++) {
-    float sum = mlp_b4[i];
-    for (int j = 0; j < MLP_H3_DIM; j++)
-      sum += h3[j] * mlp_w4[j * MLP_OUTPUT_DIM + i];
-    logits[i] = sum;
-  }
+  av2_intra_mlp_layer(h3, MLP_H3_DIM, mlp_w4, mlp_b4, logits, MLP_OUTPUT_DIM,
+                      0);
 }
 
 void intra_mode_mlp_get_topk(const float *logits, int k, int *modes) {
