@@ -191,9 +191,17 @@ void gdf_copy_guided_frame(AV2_COMMON *cm) {
                                 // 16: AVX2 vector length
   cm->gdf_info.inp_stride = input_stride;
 
-  cm->gdf_info.inp_pad_ptr =
-      (uint16_t *)avm_memalign(32, (top_buf + rec_height + bot_buf + 4) *
-                                       input_stride * sizeof(uint16_t));
+  const size_t inp_size =
+      (size_t)(top_buf + rec_height + bot_buf + 4) * input_stride;
+  if (cm->gdf_info.inp_pad_ptr == NULL ||
+      inp_size > cm->gdf_info.alloc_inp_size) {
+    avm_free(cm->gdf_info.inp_pad_ptr);
+    cm->gdf_info.inp_pad_ptr = NULL;
+    cm->gdf_info.alloc_inp_size = 0;
+    CHECK_MEM_ERROR(cm, cm->gdf_info.inp_pad_ptr,
+                    (uint16_t *)avm_memalign(32, inp_size * sizeof(uint16_t)));
+    cm->gdf_info.alloc_inp_size = inp_size;
+  }
   for (int i = top_buf; i < top_buf + rec_height; i++) {
     memcpy(
         cm->gdf_info.inp_pad_ptr + i * input_stride + GDF_TEST_EXTRA_HOR_BORDER,
@@ -424,6 +432,9 @@ void gdf_load_stripe(const AV2_COMMON *cm, GdfStripeBuf *sb, int i_min,
 
 void gdf_free_guided_frame(AV2_COMMON *cm) {
   avm_free(cm->gdf_info.inp_pad_ptr);
+  cm->gdf_info.inp_pad_ptr = NULL;
+  cm->gdf_info.inp_ptr = NULL;
+  cm->gdf_info.alloc_inp_size = 0;
 }
 
 int gdf_get_block_idx(const AV2_COMMON *cm, int y_h, int y_w) {
