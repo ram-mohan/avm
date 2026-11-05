@@ -1570,8 +1570,6 @@ void av2_wienerns_stats_batch_c(int64_t *A, const int16_t *feat,
 
 // Size of the per-class matrices in WienernsStatsScratch.
 #define WIENERNS_STATS_DIM (WIENERNS_TAPS_MAX + 1)
-// Most taps in the configs used by compute_stats_for_wienerns_filter().
-#define WIENERNS_STATS_MAX_TAPS (2 * WIENERNS_TAPS_MAX)
 
 // Per-worker scratch memory for compute_stats_for_wienerns_filter().
 typedef struct WienernsStatsScratch {
@@ -1588,6 +1586,11 @@ typedef struct WienernsStatsScratch {
   // Bitwise OR of the absolute source minus degraded values of each class, an
   // upper bound of the largest one.
   int y_max_abs[WIENERNS_MAX_CLASSES];
+  // Wiener prediction variable for all features over a block of MI_SIZE x
+  // WIENERNS_STATS_ROW pixels, block[k][row * WIENERNS_STATS_ROW + x], laid out
+  // as a batch. The row after the last feature holds the error signal.
+  DECLARE_ALIGNED(32, int16_t,
+                  block[WIENERNS_STATS_DIM][WIENERNS_STATS_BATCH]);
 } WienernsStatsScratch;
 
 // Adds the pending pixels of class c_id to its correlation matrix.
@@ -1597,7 +1600,7 @@ static void flush_wienerns_stats(WienernsStatsScratch *s, int c_id, int dim,
   if (n == 0) return;
   // The SIMD versions work on 8 pixels at a time, so pad with zeros.
   const int n8 = (n + 7) & ~7;
-  for (int k = 0; k < dim; ++k) {
+  for (int k = 0; n8 != n && k < dim; ++k) {
     memset(&s->feat[c_id][k][n], 0, (n8 - n) * sizeof(s->feat[0][0][0]));
   }
   if (feat_fits && s->y_max_abs[c_id] < WIENERNS_STATS_MAX_ABS) {
@@ -1611,45 +1614,116 @@ static void flush_wienerns_stats(WienernsStatsScratch *s, int c_id, int dim,
   s->y_max_abs[c_id] = 0;
 }
 
-// A tap of the filter: the pixel at off minus the center pixel, from the
-// degraded frame or the luma frame.
-typedef struct {
-  int off;
-  int is_luma;
-} WienernsStatsTap;
-
-// The taps of one feature: ctr center taps and taps [tap0, tap0 + num_taps).
-typedef struct {
-  int ctr;
-  int tap0;
-  int num_taps;
-} WienernsStatsFeat;
-
-// Writes len values of one feature: ctr plus the sum of its tap differences,
-// kept in int16_t as before.
-static AVM_INLINE void gather_wienerns_feature(int16_t *dst, int ctr,
-                                               const uint16_t *const *p,
-                                               const uint16_t *const *c, int n,
-                                               int len) {
-  int t;
-  if (n >= 2) {
-    const uint16_t *p0 = p[0], *c0 = c[0], *p1 = p[1], *c1 = c[1];
-    for (int x = 0; x < len; ++x) {
-      dst[x] = (int16_t)(ctr + p0[x] - c0[x] + p1[x] - c1[x]);
+// Fill wiener predictor variable at all positions for a batch of contiguous
+// pixels.
+static void wienerns_gather_features_1xn(int16_t *feat, int feat_stride,
+                                         const uint16_t *dgd,
+                                         const uint16_t *luma,
+                                         const WienernsGatherTaps *g, int len) {
+  const int *offset = g->offsets;
+  for (int k = 0; k < g->num_feat; ++k) {
+    int16_t *feat_k = feat + k * feat_stride;
+    for (int x = 0; x < len; ++x) feat_k[x] = g->num_center[k];
+    for (int t = 0; t < g->num_dgd[k]; ++t, ++offset) {
+      for (int x = 0; x < len; ++x) {
+        feat_k[x] += (int16_t)dgd[*offset + x] - (int16_t)dgd[x];
+      }
     }
-    t = 2;
-  } else if (n == 1) {
-    const uint16_t *p0 = p[0], *c0 = c[0];
-    for (int x = 0; x < len; ++x) dst[x] = (int16_t)(ctr + p0[x] - c0[x]);
-    t = 1;
-  } else {
-    for (int x = 0; x < len; ++x) dst[x] = (int16_t)ctr;
-    t = 0;
+    assert(g->num_luma[k] == 0 || luma != NULL);
+    for (int t = 0; t < g->num_luma[k]; ++t, ++offset) {
+      for (int x = 0; x < len; ++x) {
+        feat_k[x] += (int16_t)luma[*offset + x] - (int16_t)luma[x];
+      }
+    }
   }
-  for (; t < n; ++t) {
-    const uint16_t *pt = p[t], *ct = c[t];
-    for (int x = 0; x < len; ++x) {
-      dst[x] = (int16_t)(dst[x] + pt[x] - ct[x]);
+}
+
+void av2_wienerns_gather_features_1x16_c(int16_t *feat, int feat_stride,
+                                         const uint16_t *dgd,
+                                         const uint16_t *luma,
+                                         const WienernsGatherTaps *g) {
+  wienerns_gather_features_1xn(feat, feat_stride, dgd, luma, g,
+                               WIENERNS_STATS_ROW);
+}
+
+// All pixels of a 4x4 block of luma are of one class. Copies the 4x4 block at
+// feat, in raster scan order, to dst as 16 contiguous pixels per feature, to
+// append to the pending pixels of its class for the correlation.
+static void wienerns_pack_block_4x4(int16_t *dst, int dst_stride,
+                                    const int16_t *feat, int feat_stride,
+                                    int dim) {
+  for (int k = 0; k < dim; ++k) {
+    for (int r = 0; r < MI_SIZE; ++r) {
+      memcpy(dst + k * dst_stride + r * MI_SIZE,
+             feat + k * feat_stride + r * WIENERNS_STATS_ROW,
+             MI_SIZE * sizeof(*dst));
+    }
+  }
+}
+
+// Group the taps contributing to a feature.
+static void init_wienerns_gather_taps(WienernsGatherTaps *g,
+                                      const NonsepFilterConfig *config,
+                                      int is_uv, int num_feat, int dgd_stride,
+                                      int luma_stride) {
+  assert(num_feat <= WIENERNS_TAPS_MAX);
+  memset(g, 0, sizeof(*g));
+  g->num_feat = num_feat;
+  const int(*taps[2])[3] = { config->config, config->config2 };
+  const int num_taps[2] = { config->num_pixels,
+                            is_uv ? config->num_pixels2 : 0 };
+  const int stride[2] = { dgd_stride, luma_stride };
+  uint8_t *count[2] = { g->num_dgd, g->num_luma };
+  for (int s = 0; s < 2; ++s) {
+    for (int t = 0; t < num_taps[s]; ++t) {
+      const int pos = taps[s][t][WIENERNS_BUF_POS];
+      if (pos >= num_feat) continue;
+      if (taps[s][t][WIENERNS_ROW_ID] == 0 &&
+          taps[s][t][WIENERNS_COL_ID] == 0) {
+        g->num_center[pos] += (s == 0);
+      } else {
+        ++count[s][pos];
+      }
+    }
+  }
+  int next[2][WIENERNS_TAPS_MAX];
+  int total = 0;
+  for (int k = 0; k < num_feat; ++k) {
+    next[0][k] = total;
+    next[1][k] = total + g->num_dgd[k];
+    total += g->num_dgd[k] + g->num_luma[k];
+  }
+  assert(total <= WIENERNS_GATHER_MAX_TAPS);
+  for (int s = 0; s < 2; ++s) {
+    for (int t = 0; t < num_taps[s]; ++t) {
+      const int pos = taps[s][t][WIENERNS_BUF_POS];
+      const int r = taps[s][t][WIENERNS_ROW_ID];
+      const int c = taps[s][t][WIENERNS_COL_ID];
+      if (pos >= num_feat || (r == 0 && c == 0)) continue;
+      g->offsets[next[s][pos]++] = r * stride[s] + c;
+    }
+  }
+}
+
+// Adds len pixels of row r of the block, from column col, to the pending pixels
+// of class c_id.
+static void append_wienerns_block_pixels(WienernsStatsScratch *s, int c_id,
+                                         int dim, int feat_fits, int r, int col,
+                                         int len, int *num_pixels_in_class) {
+  num_pixels_in_class[c_id] += len;
+  int done = 0;
+  while (done < len) {
+    const int x0 = s->count[c_id];
+    const int n = AVMMIN(len - done, WIENERNS_STATS_BATCH - x0);
+    for (int k = 0; k < dim; ++k) {
+      memcpy(&s->feat[c_id][k][x0],
+             &s->block[k][r * WIENERNS_STATS_ROW + col + done],
+             n * sizeof(s->block[0][0]));
+    }
+    s->count[c_id] += n;
+    done += n;
+    if (s->count[c_id] == WIENERNS_STATS_BATCH) {
+      flush_wienerns_stats(s, c_id, dim, feat_fits);
     }
   }
 }
@@ -1678,62 +1752,24 @@ static int64_t compute_stats_for_wienerns_filter(
   memset(b, 0, sizeof(*b) * total_dim_b);
   memset(num_pixels_in_class, 0, sizeof(*num_pixels_in_class) * num_classes);
 
-  const NonsepFilterConfig *config = &nsfilter_params->nsfilter_config;
   const int is_uv = (rui->plane != AVM_PLANE_Y);
   const int num_feat = nsfilter_params->ncoeffs;
   const int dim = num_feat + 1;
   assert(dim <= WIENERNS_STATS_DIM);
+  assert(MI_SIZE * WIENERNS_STATS_ROW == WIENERNS_STATS_BATCH);
 
-  // Group the taps by feature, dropping the ones that add nothing.
-  WienernsStatsFeat feats[WIENERNS_STATS_DIM] = { { 0 } };
-  WienernsStatsTap taps[2 * WIENERNS_STATS_MAX_TAPS];
-  int tap_pos[2 * WIENERNS_STATS_MAX_TAPS];
-  int num_taps = 0;
-  assert(config->num_pixels <= WIENERNS_STATS_MAX_TAPS);
-  for (int k = 0; k < config->num_pixels; ++k) {
-    const int pos = config->config[k][WIENERNS_BUF_POS];
-    const int r = config->config[k][WIENERNS_ROW_ID];
-    const int c = config->config[k][WIENERNS_COL_ID];
-    if (pos >= num_feat) continue;
-    if (r == 0 && c == 0) {
-      feats[pos].ctr++;
-    } else {
-      taps[num_taps].off = r * dgd_stride + c;
-      taps[num_taps].is_luma = 0;
-      tap_pos[num_taps++] = pos;
-    }
-  }
-  if (is_uv) {
-    assert(config->num_pixels2 <= WIENERNS_STATS_MAX_TAPS);
-    for (int k = 0; k < config->num_pixels2; ++k) {
-      const int pos = config->config2[k][WIENERNS_BUF_POS];
-      const int r = config->config2[k][WIENERNS_ROW_ID];
-      const int c = config->config2[k][WIENERNS_COL_ID];
-      if (pos >= num_feat || (r == 0 && c == 0)) continue;
-      taps[num_taps].off = r * rui->luma_stride + c;
-      taps[num_taps].is_luma = 1;
-      tap_pos[num_taps++] = pos;
-    }
-  }
-  for (int t = 0; t < num_taps; ++t) feats[tap_pos[t]].num_taps++;
-  for (int k = 1; k < num_feat; ++k) {
-    feats[k].tap0 = feats[k - 1].tap0 + feats[k - 1].num_taps;
-  }
-  // Every entry below num_taps is written. The zero init is for scan-build.
-  WienernsStatsTap sorted_taps[2 * WIENERNS_STATS_MAX_TAPS] = { { 0 } };
-  int fill[WIENERNS_STATS_DIM] = { 0 };
-  for (int t = 0; t < num_taps; ++t) {
-    const int pos = tap_pos[t];
-    sorted_taps[feats[pos].tap0 + fill[pos]++] = taps[t];
-  }
+  WienernsGatherTaps taps;
+  init_wienerns_gather_taps(&taps, &nsfilter_params->nsfilter_config, is_uv,
+                            num_feat, dgd_stride, rui->luma_stride);
 
   // Check from the taps whether every feature fits the SIMD limit. The source
   // minus degraded values are checked as they are gathered.
   const int max_px = (1 << bit_depth) - 1;
   int feat_fits = 1;
   for (int k = 0; k < num_feat; ++k) {
-    feat_fits &=
-        feats[k].ctr + feats[k].num_taps * max_px < WIENERNS_STATS_MAX_ABS;
+    feat_fits &= taps.num_center[k] +
+                     (taps.num_dgd[k] + taps.num_luma[k]) * max_px <
+                 WIENERNS_STATS_MAX_ABS;
   }
 
   for (int c_id = 0; c_id < num_classes; ++c_id) {
@@ -1742,66 +1778,83 @@ static int64_t compute_stats_for_wienerns_filter(
     s->y_max_abs[c_id] = 0;
   }
 
-  for (int i = limits->v_start; i < limits->v_end; ++i) {
-    const uint16_t *dgd_row = dgd_hbd + i * dgd_stride;
-    const uint16_t *src_row = src_hbd + i * src_stride;
-    const uint16_t *luma_row = is_uv ? luma_hbd + i * rui->luma_stride : NULL;
+  for (int i = limits->v_start; i < limits->v_end; i += MI_SIZE) {
+    const int num_rows = AVMMIN(MI_SIZE, limits->v_end - i);
     const uint8_t *class_row =
         num_classes > 1 ? rui->wiener_class_id +
                               (i >> MI_SIZE_LOG2) * rui->wiener_class_id_stride
                         : NULL;
-    int j = limits->h_start;
-    while (j < limits->h_end) {
-      int c_id = 0;
-      if (num_classes > 1) {
-        c_id = pc_wiener_sub_classify[class_row[j >> MI_SIZE_LOG2]];
-        // Skip pixels not belonging to any of the classes.
-        if (c_id >= num_classes) {
-          j = AVMMIN(limits->h_end, ((j >> MI_SIZE_LOG2) + 1) << MI_SIZE_LOG2);
-          continue;
-        }
-      }
-      // Find the run of pixels from j in the same class that fit in the batch.
-      const int x0 = s->count[c_id];
-      const int run_max = AVMMIN(limits->h_end, j + WIENERNS_STATS_BATCH - x0);
-      int run_end = run_max;
-      if (num_classes > 1) {
-        run_end = ((j >> MI_SIZE_LOG2) + 1) << MI_SIZE_LOG2;
-        while (run_end < run_max &&
-               pc_wiener_sub_classify[class_row[run_end >> MI_SIZE_LOG2]] ==
-                   c_id) {
-          run_end += 1 << MI_SIZE_LOG2;
-        }
-        run_end = AVMMIN(run_end, run_max);
-      }
-      const int len = run_end - j;
-
-      // Each feature is written once, so there is nothing to clear first.
-      const uint16_t *tap_p[2 * WIENERNS_STATS_MAX_TAPS];
-      const uint16_t *tap_c[2 * WIENERNS_STATS_MAX_TAPS];
-      for (int t = 0; t < num_taps; ++t) {
-        tap_c[t] = (sorted_taps[t].is_luma ? luma_row : dgd_row) + j;
-        tap_p[t] = tap_c[t] + sorted_taps[t].off;
-      }
-      int16_t(*feat)[WIENERNS_STATS_BATCH] = s->feat[c_id];
-      for (int k = 0; k < num_feat; ++k) {
-        const WienernsStatsFeat *f = &feats[k];
-        gather_wienerns_feature(&feat[k][x0], f->ctr, &tap_p[f->tap0],
-                                &tap_c[f->tap0], f->num_taps, len);
-      }
-      int16_t *y = &feat[num_feat][x0];
+    for (int j = limits->h_start; j < limits->h_end; j += WIENERNS_STATS_ROW) {
+      const int len = AVMMIN(WIENERNS_STATS_ROW, limits->h_end - j);
       int y_max_abs = 0;
-      for (int x = 0; x < len; ++x) {
-        y[x] = (int16_t)((int)src_row[j + x] - (int)dgd_row[j + x]);
-        y_max_abs |= abs(y[x]);
+      for (int r = 0; r < num_rows; ++r) {
+        const uint16_t *dgd = &dgd_hbd[(i + r) * dgd_stride + j];
+        const uint16_t *src = &src_hbd[(i + r) * src_stride + j];
+        const uint16_t *luma =
+            is_uv ? &luma_hbd[(i + r) * rui->luma_stride + j] : NULL;
+        int16_t *feat = &s->block[0][r * WIENERNS_STATS_ROW];
+        if (len == WIENERNS_STATS_ROW) {
+          av2_wienerns_gather_features_1x16(feat, WIENERNS_STATS_BATCH, dgd,
+                                            luma, &taps);
+        } else {
+          wienerns_gather_features_1xn(feat, WIENERNS_STATS_BATCH, dgd, luma,
+                                       &taps, len);
+        }
+        int16_t *y = &s->block[num_feat][r * WIENERNS_STATS_ROW];
+        for (int x = 0; x < len; ++x) {
+          y[x] = (int16_t)((int)src[x] - (int)dgd[x]);
+          y_max_abs |= abs(y[x]);
+        }
       }
-      s->y_max_abs[c_id] |= y_max_abs;
-      s->count[c_id] += len;
-      num_pixels_in_class[c_id] += len;
-      if (s->count[c_id] == WIENERNS_STATS_BATCH) {
-        flush_wienerns_stats(s, c_id, dim, feat_fits);
+
+      int block_class[WIENERNS_STATS_ROW / MI_SIZE] = { 0 };
+      if (num_classes > 1) {
+        for (int m = 0; m * MI_SIZE < len; ++m) {
+          block_class[m] =
+              pc_wiener_sub_classify[class_row[(j >> MI_SIZE_LOG2) + m]];
+        }
       }
-      j += len;
+      const int is_full_block =
+          num_rows == MI_SIZE && len == WIENERNS_STATS_ROW;
+      const int c0 = block_class[0];
+      if (is_full_block && c0 < num_classes && s->count[c0] == 0 &&
+          block_class[1] == c0 && block_class[2] == c0 &&
+          block_class[3] == c0) {
+        if (feat_fits && y_max_abs < WIENERNS_STATS_MAX_ABS) {
+          av2_wienerns_stats_batch(s->corr[c0], s->block[0],
+                                   WIENERNS_STATS_BATCH, WIENERNS_STATS_BATCH,
+                                   dim);
+        } else {
+          av2_wienerns_stats_batch_c(s->corr[c0], s->block[0],
+                                     WIENERNS_STATS_BATCH, WIENERNS_STATS_BATCH,
+                                     dim);
+        }
+        num_pixels_in_class[c0] += WIENERNS_STATS_BATCH;
+        continue;
+      }
+      for (int m = 0; m * MI_SIZE < len; ++m) {
+        const int c_id = block_class[m];
+        // Skip pixels not belonging to any of the classes.
+        if (c_id >= num_classes) continue;
+        const int col = m * MI_SIZE;
+        s->y_max_abs[c_id] |= y_max_abs;
+        const int x0 = s->count[c_id];
+        if (is_full_block && x0 + MI_SIZE * MI_SIZE <= WIENERNS_STATS_BATCH) {
+          wienerns_pack_block_4x4(&s->feat[c_id][0][x0], WIENERNS_STATS_BATCH,
+                                  &s->block[0][col], WIENERNS_STATS_BATCH, dim);
+          s->count[c_id] += MI_SIZE * MI_SIZE;
+          num_pixels_in_class[c_id] += MI_SIZE * MI_SIZE;
+          if (s->count[c_id] == WIENERNS_STATS_BATCH) {
+            flush_wienerns_stats(s, c_id, dim, feat_fits);
+          }
+        } else {
+          const int n = AVMMIN(MI_SIZE, len - col);
+          for (int r = 0; r < num_rows; ++r) {
+            append_wienerns_block_pixels(s, c_id, dim, feat_fits, r, col, n,
+                                         num_pixels_in_class);
+          }
+        }
+      }
     }
   }
 
