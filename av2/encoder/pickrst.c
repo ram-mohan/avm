@@ -1738,9 +1738,7 @@ static int64_t compute_stats_for_wienerns_filter(
     int num_classes, WienernsStatsScratch *s) {
   const uint16_t *luma_hbd = rui->luma;
 
-  const int total_dim_A = num_classes * WIENERNS_TAPS_MAX * WIENERNS_TAPS_MAX;
   const int stride_A = WIENERNS_TAPS_MAX * WIENERNS_TAPS_MAX;
-  const int total_dim_b = num_classes * WIENERNS_TAPS_MAX;
   const int stride_b = WIENERNS_TAPS_MAX;
 
   const int set_index =
@@ -1748,8 +1746,6 @@ static int64_t compute_stats_for_wienerns_filter(
   const uint8_t *pc_wiener_sub_classify =
       get_pc_wiener_sub_classifier(num_classes, set_index);
 
-  memset(A, 0, sizeof(*A) * total_dim_A);
-  memset(b, 0, sizeof(*b) * total_dim_b);
   memset(num_pixels_in_class, 0, sizeof(*num_pixels_in_class) * num_classes);
 
   const int is_uv = (rui->plane != AVM_PLANE_Y);
@@ -2184,6 +2180,9 @@ double accumulate_merge_stats(const RestSearchCtxt *rsc,
   return cost_nomerge_cand;
 }
 
+#define RU_ON_WEIGHT 1
+#define RU_OFF_WEIGHT 1e-10
+
 // Records the RU in rsc->wienerns_stats. The stats themselves are computed
 // later by compute_wienerns_stats_mt().
 static void gather_stats_wienerns(const RestorationTileLimits *limits,
@@ -2197,14 +2196,20 @@ static void gather_stats_wienerns(const RestorationTileLimits *limits,
   RestSearchCtxt *rsc = (RestSearchCtxt *)priv;
   assert(rsc->num_filter_classes == rsc->wienerns_bank.filter[0].num_classes);
 
-  RstUnitStats unit_stats;
-  memset(&unit_stats, 0, sizeof(unit_stats));
-  unit_stats.ru_idx = rest_unit_idx;
-  unit_stats.ru_idx_in_tile = rest_unit_idx_in_rutile - rsc->ru_idx_base;
-  unit_stats.limits = *limits;
-  unit_stats.plane = rsc->plane;
-  unit_stats.num_stats_classes = rsc->num_stats_classes;
-  avm_vector_push_back(rsc->wienerns_stats, &unit_stats);
+  if (avm_vector_resize(rsc->wienerns_stats, rsc->wienerns_stats->size + 1) ==
+      VECTOR_ERROR)
+    return;
+  RstUnitStats *unit_stats =
+      (RstUnitStats *)avm_vector_back(rsc->wienerns_stats);
+  if (rsc->rusi[rest_unit_idx].bru_unit_skipped) {
+    memset(unit_stats, 0, sizeof(*unit_stats));
+  }
+  unit_stats->weight = RU_ON_WEIGHT;
+  unit_stats->ru_idx = rest_unit_idx;
+  unit_stats->ru_idx_in_tile = rest_unit_idx_in_rutile - rsc->ru_idx_base;
+  unit_stats->limits = *limits;
+  unit_stats->plane = rsc->plane;
+  unit_stats->num_stats_classes = rsc->num_stats_classes;
 }
 
 // Computes the stats of one RU recorded by gather_stats_wienerns(). Only reads
@@ -3297,7 +3302,12 @@ static void gather_stats_rest_type(RestSearchCtxt *rsc, RestorationType rtype) {
   static const rest_unit_visitor_t funs[RESTORE_TYPES] = {
     NULL, NULL, gather_stats_wienerns, NULL
   };
-  if (rtype == RESTORE_WIENER_NONSEP) avm_vector_clear(rsc->wienerns_stats);
+  if (rtype == RESTORE_WIENER_NONSEP) {
+    const RestorationInfo *rsi = &rsc->cm->rst_info[rsc->plane];
+    avm_vector_clear(rsc->wienerns_stats);
+    avm_vector_reserve(rsc->wienerns_stats,
+                       rsi->horz_units_per_frame * rsi->vert_units_per_frame);
+  }
 
   if (funs[rtype]) process_by_rutile(rsc, funs[rtype]);
   if (rtype == RESTORE_WIENER_NONSEP) compute_wienerns_stats_mt(rsc);
@@ -3371,39 +3381,47 @@ const uint8_t *get_class_converter(const RestSearchCtxt *rsc,
 // target_classes < num_classes (without recalculating stats from data). This is
 // possible since the classification design resuls in class labels over a tree
 // having WIENERNS_MAX_CLASSES leaves reduced to the single-class root.
-static void collapse_stats_to_target_classes(int target_classes,
+static void collapse_stats_to_target_classes(int target_classes, int num_feat,
                                              const uint8_t *class_converter,
                                              RstUnitStats *unit_stats) {
-  assert(unit_stats->num_stats_classes >= target_classes);
-  if (unit_stats->num_stats_classes == target_classes) return;
-
-  // TODO: Reduce buffer/copy size.
-  RstUnitStats collapsed_unit_stats;
-  memset(&collapsed_unit_stats, 0, sizeof(collapsed_unit_stats));
-  collapsed_unit_stats.ru_idx = unit_stats->ru_idx;
-  collapsed_unit_stats.ru_idx_in_tile = unit_stats->ru_idx_in_tile;
-  collapsed_unit_stats.plane = unit_stats->plane;
-  collapsed_unit_stats.real_sse = unit_stats->real_sse;
-  collapsed_unit_stats.limits = unit_stats->limits;
-  collapsed_unit_stats.weight = unit_stats->weight;
-  collapsed_unit_stats.num_stats_classes = target_classes;
+  const int num_classes = unit_stats->num_stats_classes;
+  assert(num_classes >= target_classes);
+  if (num_classes == target_classes) return;
 
   const int stride_A = WIENERNS_TAPS_MAX * WIENERNS_TAPS_MAX;
   const int stride_b = WIENERNS_TAPS_MAX;
-  for (int c_id = 0; c_id < unit_stats->num_stats_classes; ++c_id) {
+  const int dim_A = num_feat * num_feat;
+  double A[WIENERNS_R_SIZE];
+  double b[WIENERNS_B_SIZE];
+  int num_pixels[WIENERNS_MAX_CLASSES];
+  av2_zero_array(A, target_classes * dim_A);
+  av2_zero_array(b, target_classes * num_feat);
+  av2_zero_array(num_pixels, target_classes);
+  for (int c_id = 0; c_id < num_classes; ++c_id) {
     const int tc_id = class_converter[c_id];
-    for (int i = 0; i < stride_A; ++i) {
-      collapsed_unit_stats.A[tc_id * stride_A + i] +=
-          unit_stats->A[c_id * stride_A + i];
+    assert(tc_id < target_classes);
+    for (int i = 0; i < dim_A; ++i) {
+      A[tc_id * dim_A + i] += unit_stats->A[c_id * stride_A + i];
     }
-    for (int i = 0; i < stride_b; ++i) {
-      collapsed_unit_stats.b[tc_id * stride_b + i] +=
-          unit_stats->b[c_id * stride_b + i];
+    for (int i = 0; i < num_feat; ++i) {
+      b[tc_id * num_feat + i] += unit_stats->b[c_id * stride_b + i];
     }
-    collapsed_unit_stats.num_pixels_in_class[tc_id] +=
-        unit_stats->num_pixels_in_class[c_id];
+    num_pixels[tc_id] += unit_stats->num_pixels_in_class[c_id];
   }
-  *unit_stats = collapsed_unit_stats;
+
+  for (int c_id = 0; c_id < target_classes; ++c_id) {
+    memcpy(&unit_stats->A[c_id * stride_A], &A[c_id * dim_A],
+           dim_A * sizeof(*A));
+    memcpy(&unit_stats->b[c_id * stride_b], &b[c_id * num_feat],
+           num_feat * sizeof(*b));
+    unit_stats->num_pixels_in_class[c_id] = num_pixels[c_id];
+  }
+  for (int c_id = target_classes; c_id < num_classes; ++c_id) {
+    av2_zero_array(&unit_stats->A[c_id * stride_A], dim_A);
+    av2_zero_array(&unit_stats->b[c_id * stride_b], num_feat);
+    unit_stats->num_pixels_in_class[c_id] = 0;
+  }
+  unit_stats->num_stats_classes = target_classes;
 }
 
 // Initial set of stats are determined using num_stats_classes classes. This
@@ -3413,11 +3431,14 @@ static void collapse_all_stats(RestSearchCtxt *rsc, int num_stats_classes,
                                int num_target_classes) {
   const uint8_t *class_converter =
       get_class_converter(rsc, num_stats_classes, num_target_classes);
+  const WienernsFilterParameters *nsfilter_params = get_wienerns_parameters(
+      rsc->cm->quant_params.base_qindex, rsc->plane != AVM_PLANE_Y);
+  const int num_feat = nsfilter_params->ncoeffs;
   VECTOR_FOR_EACH(rsc->wienerns_stats, unit_stats) {
     RstUnitStats *unit_stats_ptr = (RstUnitStats *)unit_stats.pointer;
     assert(unit_stats_ptr->num_stats_classes == num_stats_classes);
-    collapse_stats_to_target_classes(num_target_classes, class_converter,
-                                     unit_stats_ptr);
+    collapse_stats_to_target_classes(num_target_classes, num_feat,
+                                     class_converter, unit_stats_ptr);
   }
 }
 
@@ -3446,17 +3467,24 @@ static int count_classes_with_no_pixels(const RestSearchCtxt *rsc) {
 // frame-level Wiener filters.
 static void weighted_sum_all_stats(const RestSearchCtxt *rsc,
                                    RstUnitStats *sum_stats, int num_feat) {
-  memset(sum_stats, 0, sizeof(*sum_stats));
-
   // Get a sample to fill the basic fields of sum_stats;
   const RstUnitStats *sample_stat =
       avm_vector_begin(rsc->wienerns_stats).pointer;
   sum_stats->ru_idx = sample_stat->ru_idx;
   sum_stats->plane = sample_stat->plane;
   sum_stats->num_stats_classes = sample_stat->num_stats_classes;
+  sum_stats->ru_idx_in_tile = 0;
+  sum_stats->limits = sample_stat->limits;
+  sum_stats->real_sse = 0;
+  sum_stats->weight = 0;
 
   const int stride_A = WIENERNS_TAPS_MAX * WIENERNS_TAPS_MAX;
   const int stride_b = WIENERNS_TAPS_MAX;
+  for (int c_id = 0; c_id < sum_stats->num_stats_classes; ++c_id) {
+    av2_zero_array(sum_stats->A + c_id * stride_A, num_feat * num_feat);
+    av2_zero_array(sum_stats->b + c_id * stride_b, num_feat);
+  }
+  av2_zero_array(sum_stats->num_pixels_in_class, WIENERNS_MAX_CLASSES);
   VECTOR_FOR_EACH(rsc->wienerns_stats, unit_stats) {
     const RstUnitStats *unit_stat = (const RstUnitStats *)unit_stats.pointer;
     const double weight = unit_stat->weight;
@@ -3618,9 +3646,6 @@ static void solve_filters_from_stats_wienerns(const RestSearchCtxt *rsc,
     }
   }
 }
-
-#define RU_ON_WEIGHT 1
-#define RU_OFF_WEIGHT 1e-10
 
 typedef struct {
   const RestSearchCtxt *rsc;
@@ -3913,13 +3938,6 @@ static double optimize_frame_filters_for_target_classes(
   return best_cost;
 }
 
-static AVM_INLINE void initialize_stat_weights(RestSearchCtxt *rsc) {
-  VECTOR_FOR_EACH(rsc->wienerns_stats, unit_stats) {
-    RstUnitStats *unit_stats_ptr = (RstUnitStats *)(unit_stats.pointer);
-    unit_stats_ptr->weight = RU_ON_WEIGHT;
-  }
-}
-
 #define USE_FINER_TILE 1
 
 #if USE_FINER_TILE
@@ -3986,6 +4004,27 @@ static double optimize_frame_filters_with_rounding(
 }
 #endif  // USE_FINER_TILE
 
+static void copy_unit_stats(RstUnitStats *dst, const RstUnitStats *src,
+                            int num_feat) {
+  const int stride_A = WIENERNS_TAPS_MAX * WIENERNS_TAPS_MAX;
+  const int stride_b = WIENERNS_TAPS_MAX;
+  for (int c_id = 0; c_id < src->num_stats_classes; ++c_id) {
+    memcpy(&dst->A[c_id * stride_A], &src->A[c_id * stride_A],
+           num_feat * num_feat * sizeof(*src->A));
+    memcpy(&dst->b[c_id * stride_b], &src->b[c_id * stride_b],
+           num_feat * sizeof(*src->b));
+  }
+  dst->weight = src->weight;
+  dst->real_sse = src->real_sse;
+  dst->num_stats_classes = src->num_stats_classes;
+  dst->limits = src->limits;
+  memcpy(dst->num_pixels_in_class, src->num_pixels_in_class,
+         sizeof(src->num_pixels_in_class));
+  dst->ru_idx = src->ru_idx;
+  dst->ru_idx_in_tile = src->ru_idx_in_tile;
+  dst->plane = src->plane;
+}
+
 // At the end of this routine all stats will be collapsed to one.
 static void find_optimal_num_classes_and_frame_filters(RestSearchCtxt *rsc) {
   const int max_num_classes_allowed = max_num_classes(rsc->plane);
@@ -4005,7 +4044,6 @@ static void find_optimal_num_classes_and_frame_filters(RestSearchCtxt *rsc) {
   int best_utilization = 0;
   int best_num_classes = -1;
   int num_stats_classes = rsc->num_stats_classes;
-  initialize_stat_weights(rsc);
   rsc->temporal_pred_flag = 0;
 
   // Optionally pick the class count in the statistics domain: all candidates
@@ -4017,10 +4055,17 @@ static void find_optimal_num_classes_and_frame_filters(RestSearchCtxt *rsc) {
   RstUnitStats *saved_stats = NULL;
   if (rsc->lpf_sf->wienerns_stat_class_search && max_num_classes_allowed > 1 &&
       num_stat_units > 0) {
-    const size_t stats_bytes = num_stat_units * sizeof(*saved_stats);
-    saved_stats = (RstUnitStats *)avm_malloc(stats_bytes);
+    const int num_feat =
+        get_wienerns_parameters(rsc->cm->quant_params.base_qindex,
+                                rsc->plane != AVM_PLANE_Y)
+            ->ncoeffs;
+    RstUnitStats *stats = (RstUnitStats *)avm_vector_front(rsc->wienerns_stats);
+    saved_stats =
+        (RstUnitStats *)avm_malloc(num_stat_units * sizeof(*saved_stats));
     if (saved_stats != NULL) {
-      memcpy(saved_stats, avm_vector_front(rsc->wienerns_stats), stats_bytes);
+      for (size_t u = 0; u < num_stat_units; ++u) {
+        copy_unit_stats(&saved_stats[u], &stats[u], num_feat);
+      }
       double stat_best_cost = DBL_MAX;
       WienerNonsepInfo stat_filter = { 0 };
       for (int i = 0; i < num_try; ++i) {
@@ -4040,7 +4085,10 @@ static void find_optimal_num_classes_and_frame_filters(RestSearchCtxt *rsc) {
         }
       }
       // Restore the original stats and weights and the starting class count.
-      memcpy(avm_vector_front(rsc->wienerns_stats), saved_stats, stats_bytes);
+      stats = (RstUnitStats *)avm_vector_front(rsc->wienerns_stats);
+      for (size_t u = 0; u < num_stat_units; ++u) {
+        copy_unit_stats(&stats[u], &saved_stats[u], num_feat);
+      }
       num_stats_classes = rsc->num_stats_classes;
       avm_free(saved_stats);
       saved_stats = NULL;
